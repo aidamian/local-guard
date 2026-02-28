@@ -16,6 +16,7 @@ Client behavior is capture-and-deliver: no client-side censorship or content mut
 
 - `README.md`: repository overview and operating guidance.
 - `TODO.md`: product brief + execution roadmap (single source of execution state).
+- `DEVLOG.md`: chronological implementation log of critical execution steps.
 - `AGENTS.md`: contributor/agent operating protocol.
 
 ## Development environment
@@ -46,6 +47,12 @@ Use environment variables (or secure OS config storage):
 - `LOCAL_GUARD_BATCH_SIZE` (default `9`)
 
 Do not hardcode credentials, API keys, or long-lived tokens.
+
+## Versioning
+
+- Source-of-truth version file: `VERSION`
+- Initial version: `v0.1.0`
+- The simple desktop UI must display this version value at runtime.
 
 ## Windows manual test artifacts
 

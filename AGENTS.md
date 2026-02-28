@@ -6,6 +6,7 @@ Guidance for coding agents and contributors working in this repository.
 
 - `README.md` holds repository/project description and onboarding context.
 - `TODO.md` is the single source of truth for product brief and execution plan.
+- `DEVLOG.md` is the chronological execution diary for critical implementation actions.
 - `AGENTS.md` contains horizontal instructions for contributors and coding agents.
 
 ## Planning protocol (state-of-the-art iterative refinement)
@@ -76,6 +77,22 @@ Documentation quality gates for implementation PRs:
 - `#![warn(missing_docs)]` (or stricter) enabled for workspace crates.
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items` passes.
 - `cargo test --workspace --doc` passes once doc examples are introduced.
+
+Versioning rule:
+
+- Repository root `VERSION` is the single source of truth for app version (initially `v0.1.0`).
+- UI version display must be derived from this source (directly or build-time generated constant), never hardcoded in multiple locations.
+- Any version bump must update `VERSION`, affected tests, and release notes in the same change.
+
+## Execution devlog (mandatory)
+
+During implementation, maintain `DEVLOG.md` as an append-only step-by-step record from scaffolding to final touches.
+
+- Log every critical step (architecture choice, scaffold changes, module integration, security hardening, packaging, release prep).
+- Write entries in chronological order with explicit phase mapping (for example `Phase 3`).
+- Each entry must include: timestamp, objective, actions performed, files changed, commands run, verification result, and next step.
+- Do not defer logging until the end of a milestone; update `DEVLOG.md` continuously during execution.
+- If a decision is reversed, add a new corrective entry; never silently rewrite history.
 
 ## Documentation hygiene
 
