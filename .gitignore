@@ -22,3 +22,10 @@ target
 
 PROMPT.md
 TODO.md
+
+# Manual Windows build drop folder
+dist/win32/*.exe
+dist/win32/*.pdb
+!dist/win32/.gitkeep
+
+
