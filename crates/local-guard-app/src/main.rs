@@ -102,6 +102,9 @@ mod win32_ui {
     struct RunLogger {
         file: Mutex<File>,
         path: PathBuf,
+        run_id: String,
+        started_at: Instant,
+        process_id: u32,
     }
 
     impl RunLogger {
@@ -113,8 +116,8 @@ mod win32_ui {
                 .ok_or_else(|| "executable parent directory is missing".to_string())?
                 .to_path_buf();
 
-            let timestamp = timestamp_compact_utc();
-            let path = exe_dir.join(format!("{timestamp}_log.txt"));
+            let run_id = timestamp_compact_utc();
+            let path = exe_dir.join(format!("{run_id}_log.txt"));
             let file = OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -126,12 +129,22 @@ mod win32_ui {
             Ok(Self {
                 file: Mutex::new(file),
                 path,
+                run_id,
+                started_at: Instant::now(),
+                process_id: std::process::id(),
             })
         }
 
         fn write_line(&self, level: &str, stage: &str, action: &str, detail: &str) {
             let timestamp = timestamp_compact_utc();
-            let line = format!("{timestamp} | {level} | {stage} | {action} | {detail}\n");
+            let uptime_ms = self.started_at.elapsed().as_millis();
+            let current_thread = std::thread::current();
+            let thread_name = current_thread.name().unwrap_or("unnamed");
+            let thread_id = format!("{:?}", std::thread::current().id());
+            let line = format!(
+                "{timestamp} | {level} | {stage} | {action} | run_id={} uptime_ms={} pid={} thread={} tid={} | {detail}\n",
+                self.run_id, uptime_ms, self.process_id, thread_name, thread_id
+            );
 
             if let Ok(mut file) = self.file.lock() {
                 let _ = file.write_all(line.as_bytes());
@@ -139,6 +152,10 @@ mod win32_ui {
                     let _ = file.flush();
                 }
             }
+        }
+
+        fn run_id(&self) -> &str {
+            &self.run_id
         }
     }
 
@@ -174,14 +191,30 @@ mod win32_ui {
         json_path: PathBuf,
         jpeg_size_bytes: usize,
         json_size_bytes: usize,
+        base64_size_chars: usize,
+        raw_rgb_bytes: usize,
+        stage_metrics: StageTimingMetrics,
         preview_bitmap: PreviewBitmap,
+    }
+
+    /// Timing breakdown for staging one 3x3 mosaic payload.
+    #[derive(Debug, Clone, Copy)]
+    struct StageTimingMetrics {
+        rgba_to_rgb_ms: u128,
+        jpeg_encode_ms: u128,
+        json_encode_ms: u128,
+        disk_write_ms: u128,
+        preview_build_ms: u128,
+        stage_total_ms: u128,
     }
 
     enum WorkerCommand {
         CaptureTick {
+            timer_tick_seq: u64,
             display_id: String,
             session_id: String,
             captured_at_ms: u64,
+            queued_at: Instant,
         },
         ResetBatch,
         Shutdown,
@@ -189,11 +222,14 @@ mod win32_ui {
 
     enum WorkerEvent {
         TickCaptured {
+            timer_tick_seq: u64,
             frame_number: u64,
             buffered_frames: usize,
+            queue_wait_ms: u128,
             capture_duration_ms: u128,
         },
         BatchPrepared {
+            timer_tick_seq: u64,
             frame_number: u64,
             prepared_batches: u64,
             mosaic_width: u32,
@@ -210,6 +246,74 @@ mod win32_ui {
         worker_join: JoinHandle<()>,
     }
 
+    #[derive(Default)]
+    struct PerfStats {
+        timer_ticks_total: u64,
+        timer_ticks_dispatched: u64,
+        timer_ticks_skipped: u64,
+        worker_events_total: u64,
+        worker_errors_total: u64,
+        frames_captured_total: u64,
+        batches_prepared_total: u64,
+        queue_wait_ms_total: u128,
+        queue_wait_ms_max: u128,
+        capture_ms_total: u128,
+        capture_ms_max: u128,
+        batch_prepare_ms_total: u128,
+        batch_prepare_ms_max: u128,
+        stage_total_ms_total: u128,
+        stage_total_ms_max: u128,
+        jpeg_bytes_total: u128,
+        json_bytes_total: u128,
+        raw_rgb_bytes_total: u128,
+        base64_chars_total: u128,
+        last_tick_seq: u64,
+    }
+
+    impl PerfStats {
+        fn summary_line(&self) -> String {
+            let avg_capture_ms = average_ms(self.capture_ms_total, self.frames_captured_total);
+            let avg_queue_wait_ms =
+                average_ms(self.queue_wait_ms_total, self.frames_captured_total);
+            let avg_batch_prepare_ms =
+                average_ms(self.batch_prepare_ms_total, self.batches_prepared_total);
+            let avg_stage_total_ms =
+                average_ms(self.stage_total_ms_total, self.batches_prepared_total);
+            let avg_jpeg_bytes = average_u128(self.jpeg_bytes_total, self.batches_prepared_total);
+            let avg_json_bytes = average_u128(self.json_bytes_total, self.batches_prepared_total);
+            let overall_jpeg_ratio =
+                compression_ratio(self.raw_rgb_bytes_total, self.jpeg_bytes_total);
+            let overall_base64_ratio =
+                compression_ratio(self.raw_rgb_bytes_total, self.base64_chars_total);
+
+            format!(
+                "ticks_total={} ticks_dispatched={} ticks_skipped={} frames={} batches={} worker_events={} worker_errors={} avg_queue_wait_ms={} max_queue_wait_ms={} avg_capture_ms={} max_capture_ms={} avg_batch_prepare_ms={} max_batch_prepare_ms={} avg_stage_total_ms={} max_stage_total_ms={} avg_jpeg_bytes={} avg_json_bytes={} total_raw_rgb_bytes={} total_jpeg_bytes={} total_base64_chars={} overall_jpeg_ratio={} overall_base64_ratio={}",
+                self.timer_ticks_total,
+                self.timer_ticks_dispatched,
+                self.timer_ticks_skipped,
+                self.frames_captured_total,
+                self.batches_prepared_total,
+                self.worker_events_total,
+                self.worker_errors_total,
+                avg_queue_wait_ms,
+                self.queue_wait_ms_max,
+                avg_capture_ms,
+                self.capture_ms_max,
+                avg_batch_prepare_ms,
+                self.batch_prepare_ms_max,
+                avg_stage_total_ms,
+                self.stage_total_ms_max,
+                avg_jpeg_bytes,
+                avg_json_bytes,
+                self.raw_rgb_bytes_total,
+                self.jpeg_bytes_total,
+                self.base64_chars_total,
+                overall_jpeg_ratio,
+                overall_base64_ratio
+            )
+        }
+    }
+
     struct AppController {
         ui_state: UiState,
         auth_machine: AuthStateMachine,
@@ -219,8 +323,10 @@ mod win32_ui {
         capturing: bool,
         capture_tick_in_flight: bool,
         capture_timer_interval_ms: u32,
+        timer_tick_seq: u64,
         current_frame_number: u64,
         current_capture_duration_ms: u128,
+        current_queue_wait_ms: u128,
         current_encode_duration_ms: u128,
         frames_buffered: usize,
         prepared_batches: u64,
@@ -229,6 +335,7 @@ mod win32_ui {
         last_prepared_json: Option<PathBuf>,
         preview_bitmap: Option<PreviewBitmap>,
         worker_runtime: Option<CaptureWorkerRuntime>,
+        perf_stats: PerfStats,
     }
 
     impl AppController {
@@ -254,8 +361,10 @@ mod win32_ui {
                 capturing: false,
                 capture_tick_in_flight: false,
                 capture_timer_interval_ms: 1_000,
+                timer_tick_seq: 0,
                 current_frame_number: 0,
                 current_capture_duration_ms: 0,
+                current_queue_wait_ms: 0,
                 current_encode_duration_ms: 0,
                 frames_buffered: 0,
                 prepared_batches: 0,
@@ -264,6 +373,7 @@ mod win32_ui {
                 last_prepared_json: None,
                 preview_bitmap: None,
                 worker_runtime: None,
+                perf_stats: PerfStats::default(),
             })
         }
     }
@@ -296,19 +406,48 @@ mod win32_ui {
     /// Starts the UI event loop and blocks until the user closes the window.
     pub fn run_main_window() -> Result<(), String> {
         initialize_logger()?;
+        let capture_fps = capture_fps_from_env();
         log_info(
             "bootstrap",
             "startup",
             &format!(
-                "version={} capture_enabled={}",
+                "version={} capture_enabled={} capture_fps={} jpeg_quality={} preview_max={}x{} auth_endpoint={} exe={}",
                 app_version(),
-                capture_enabled_from_env()
+                capture_enabled_from_env(),
+                capture_fps,
+                MOSAIC_JPEG_QUALITY,
+                PREVIEW_MAX_WIDTH,
+                PREVIEW_MAX_HEIGHT,
+                AUTH_ENDPOINT,
+                std::env::current_exe()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|_| "unknown".to_string())
             ),
         );
 
         let controller = AppController::new()?;
         APP_CONTROLLER.with(|slot| {
             *slot.borrow_mut() = Some(controller);
+        });
+        let _ = with_controller_mut(|controller| {
+            log_info(
+                "bootstrap",
+                "display_inventory",
+                &format!(
+                    "display_count={} displays={}",
+                    controller.displays.len(),
+                    controller
+                        .displays
+                        .iter()
+                        .map(|display| format!(
+                            "{}:{}x{}",
+                            display.id, display.width, display.height
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            );
+            Ok(())
         });
 
         let instance = unsafe {
@@ -470,6 +609,11 @@ mod win32_ui {
             WM_DESTROY => {
                 let _ = with_controller_mut(|controller| {
                     stop_capture_timer(hwnd, controller);
+                    log_info(
+                        "perf",
+                        "capture_profile_summary",
+                        &controller.perf_stats.summary_line(),
+                    );
                     shutdown_capture_worker(controller);
                     Ok(())
                 });
@@ -980,13 +1124,16 @@ mod win32_ui {
 
             controller.current_frame_number = 0;
             controller.current_capture_duration_ms = 0;
+            controller.current_queue_wait_ms = 0;
             controller.current_encode_duration_ms = 0;
+            controller.timer_tick_seq = 0;
             controller.frames_buffered = 0;
             controller.prepared_batches = 0;
             controller.last_prepared_jpeg = None;
             controller.last_prepared_json = None;
             controller.preview_bitmap = None;
             controller.capture_tick_in_flight = false;
+            controller.perf_stats = PerfStats::default();
             controller.ui_state.capture = StageStatus::Running;
             controller.ui_state.network = StageStatus::Idle;
             controller.ui_state.upload = StageStatus::Idle;
@@ -1022,10 +1169,21 @@ mod win32_ui {
                 "capture",
                 "start",
                 &format!(
-                    "fps={fps} interval_ms={interval_ms} backend={} worker=enabled",
-                    controller.capture_backend_name
+                    "fps={fps} interval_ms={interval_ms} backend={} worker=enabled selected_display={} session_id_len={}",
+                    controller.capture_backend_name,
+                    controller
+                        .ui_state
+                        .selected_display
+                        .as_deref()
+                        .unwrap_or("none"),
+                    controller
+                        .session_token
+                        .as_ref()
+                        .map(|session| session.session_id.len())
+                        .unwrap_or(0)
                 ),
             );
+            log_info("perf", "capture_profile_started", "summary_reset=true");
             Ok(())
         })
     }
@@ -1039,6 +1197,7 @@ mod win32_ui {
 
             controller.capture_tick_in_flight = false;
             controller.frames_buffered = 0;
+            controller.current_queue_wait_ms = 0;
             controller.ui_state.capture = StageStatus::Idle;
             controller.ui_state.analysis_status = "Capture stopped.".to_string();
 
@@ -1050,6 +1209,11 @@ mod win32_ui {
             }
 
             log_info("capture", "stop", "capture stopped by user action");
+            log_info(
+                "perf",
+                "capture_profile_summary",
+                &controller.perf_stats.summary_line(),
+            );
             Ok(())
         })
     }
@@ -1059,6 +1223,9 @@ mod win32_ui {
             if !controller.capturing {
                 return Ok(());
             }
+
+            controller.perf_stats.timer_ticks_total =
+                controller.perf_stats.timer_ticks_total.saturating_add(1);
 
             sync_auth_state(controller);
             if controller.ui_state.auth != UiAuthState::Authenticated {
@@ -1087,10 +1254,16 @@ mod win32_ui {
                 .ok_or_else(|| "no display selected for capture tick".to_string())?;
 
             if controller.capture_tick_in_flight {
+                controller.perf_stats.timer_ticks_skipped =
+                    controller.perf_stats.timer_ticks_skipped.saturating_add(1);
                 log_info(
                     "capture",
                     "tick_skipped",
-                    "worker is still processing previous tick",
+                    &format!(
+                        "reason=in_flight skipped_total={} last_tick_seq={}",
+                        controller.perf_stats.timer_ticks_skipped,
+                        controller.perf_stats.last_tick_seq
+                    ),
                 );
                 return Ok(());
             }
@@ -1099,11 +1272,15 @@ mod win32_ui {
                 .session_token
                 .as_ref()
                 .ok_or_else(|| "missing session token for payload preparation".to_string())?;
+            controller.timer_tick_seq = controller.timer_tick_seq.saturating_add(1);
+            let timer_tick_seq = controller.timer_tick_seq;
 
             let command = WorkerCommand::CaptureTick {
+                timer_tick_seq,
                 display_id: selected_display,
                 session_id: session.session_id.clone(),
                 captured_at_ms: unix_timestamp_millis() as u64,
+                queued_at: Instant::now(),
             };
             let worker = controller
                 .worker_runtime
@@ -1116,6 +1293,25 @@ mod win32_ui {
 
             controller.capture_tick_in_flight = true;
             controller.ui_state.upload = StageStatus::Running;
+            controller.perf_stats.timer_ticks_dispatched = controller
+                .perf_stats
+                .timer_ticks_dispatched
+                .saturating_add(1);
+            controller.perf_stats.last_tick_seq = timer_tick_seq;
+            log_info(
+                "capture",
+                "tick_dispatched",
+                &format!(
+                    "tick_seq={} dispatched_total={} selected_display={}",
+                    timer_tick_seq,
+                    controller.perf_stats.timer_ticks_dispatched,
+                    controller
+                        .ui_state
+                        .selected_display
+                        .as_deref()
+                        .unwrap_or("none")
+                ),
+            );
             Ok(())
         });
 
@@ -1161,13 +1357,37 @@ mod win32_ui {
             for event in drained_events {
                 match event {
                     WorkerEvent::TickCaptured {
+                        timer_tick_seq,
                         frame_number,
                         buffered_frames,
+                        queue_wait_ms,
                         capture_duration_ms,
                     } => {
                         controller.capture_tick_in_flight = false;
+                        controller.perf_stats.worker_events_total =
+                            controller.perf_stats.worker_events_total.saturating_add(1);
+                        controller.perf_stats.frames_captured_total = controller
+                            .perf_stats
+                            .frames_captured_total
+                            .saturating_add(1);
+                        controller.perf_stats.queue_wait_ms_total = controller
+                            .perf_stats
+                            .queue_wait_ms_total
+                            .saturating_add(queue_wait_ms);
+                        controller.perf_stats.queue_wait_ms_max =
+                            controller.perf_stats.queue_wait_ms_max.max(queue_wait_ms);
+                        controller.perf_stats.capture_ms_total = controller
+                            .perf_stats
+                            .capture_ms_total
+                            .saturating_add(capture_duration_ms);
+                        controller.perf_stats.capture_ms_max = controller
+                            .perf_stats
+                            .capture_ms_max
+                            .max(capture_duration_ms);
+                        controller.perf_stats.last_tick_seq = timer_tick_seq;
                         controller.current_frame_number = frame_number;
                         controller.frames_buffered = buffered_frames;
+                        controller.current_queue_wait_ms = queue_wait_ms;
                         controller.current_capture_duration_ms = capture_duration_ms;
                         controller.ui_state.analysis_status = format!(
                             "Captured frame {} (batch position {}/9).",
@@ -1179,12 +1399,17 @@ mod win32_ui {
                             "capture",
                             "frame_acquired",
                             &format!(
-                                "frame={} buffered_frames={} capture_ms={}",
-                                frame_number, buffered_frames, capture_duration_ms
+                                "tick_seq={} frame={} buffered_frames={} queue_wait_ms={} capture_ms={}",
+                                timer_tick_seq,
+                                frame_number,
+                                buffered_frames,
+                                queue_wait_ms,
+                                capture_duration_ms
                             ),
                         );
                     }
                     WorkerEvent::BatchPrepared {
+                        timer_tick_seq,
                         frame_number,
                         prepared_batches,
                         mosaic_width,
@@ -1209,21 +1434,87 @@ mod win32_ui {
                             artifacts.json_size_bytes
                         );
                         preview_changed = true;
+                        controller.perf_stats.worker_events_total =
+                            controller.perf_stats.worker_events_total.saturating_add(1);
+                        controller.perf_stats.batches_prepared_total = controller
+                            .perf_stats
+                            .batches_prepared_total
+                            .saturating_add(1);
+                        controller.perf_stats.batch_prepare_ms_total = controller
+                            .perf_stats
+                            .batch_prepare_ms_total
+                            .saturating_add(encode_duration_ms);
+                        controller.perf_stats.batch_prepare_ms_max = controller
+                            .perf_stats
+                            .batch_prepare_ms_max
+                            .max(encode_duration_ms);
+                        controller.perf_stats.stage_total_ms_total = controller
+                            .perf_stats
+                            .stage_total_ms_total
+                            .saturating_add(artifacts.stage_metrics.stage_total_ms);
+                        controller.perf_stats.stage_total_ms_max = controller
+                            .perf_stats
+                            .stage_total_ms_max
+                            .max(artifacts.stage_metrics.stage_total_ms);
+                        controller.perf_stats.jpeg_bytes_total = controller
+                            .perf_stats
+                            .jpeg_bytes_total
+                            .saturating_add(artifacts.jpeg_size_bytes as u128);
+                        controller.perf_stats.json_bytes_total = controller
+                            .perf_stats
+                            .json_bytes_total
+                            .saturating_add(artifacts.json_size_bytes as u128);
+                        controller.perf_stats.raw_rgb_bytes_total = controller
+                            .perf_stats
+                            .raw_rgb_bytes_total
+                            .saturating_add(artifacts.raw_rgb_bytes as u128);
+                        controller.perf_stats.base64_chars_total = controller
+                            .perf_stats
+                            .base64_chars_total
+                            .saturating_add(artifacts.base64_size_chars as u128);
 
                         log_info(
                             "upload_prep",
                             "artifact_ready",
                             &format!(
-                                "prepared_batches={} jpeg={} json={} encode_ms={}",
+                                "tick_seq={} prepared_batches={} jpeg={} json={} raw_rgb_bytes={} base64_chars={} batch_prepare_ms={} stage_total_ms={} rgba_to_rgb_ms={} jpeg_encode_ms={} json_encode_ms={} disk_write_ms={} preview_build_ms={} jpeg_ratio={} base64_ratio={}",
+                                timer_tick_seq,
                                 prepared_batches,
                                 artifacts.jpeg_path.display(),
                                 artifacts.json_path.display(),
-                                encode_duration_ms
+                                artifacts.raw_rgb_bytes,
+                                artifacts.base64_size_chars,
+                                encode_duration_ms,
+                                artifacts.stage_metrics.stage_total_ms,
+                                artifacts.stage_metrics.rgba_to_rgb_ms,
+                                artifacts.stage_metrics.jpeg_encode_ms,
+                                artifacts.stage_metrics.json_encode_ms,
+                                artifacts.stage_metrics.disk_write_ms,
+                                artifacts.stage_metrics.preview_build_ms,
+                                compression_ratio(
+                                    artifacts.raw_rgb_bytes as u128,
+                                    artifacts.jpeg_size_bytes as u128
+                                ),
+                                compression_ratio(
+                                    artifacts.raw_rgb_bytes as u128,
+                                    artifacts.base64_size_chars as u128
+                                )
                             ),
                         );
+                        if prepared_batches % 5 == 0 {
+                            log_info(
+                                "perf",
+                                "periodic_summary",
+                                &controller.perf_stats.summary_line(),
+                            );
+                        }
                     }
                     WorkerEvent::WorkerError(error) => {
                         controller.capture_tick_in_flight = false;
+                        controller.perf_stats.worker_events_total =
+                            controller.perf_stats.worker_events_total.saturating_add(1);
+                        controller.perf_stats.worker_errors_total =
+                            controller.perf_stats.worker_errors_total.saturating_add(1);
                         stop_capture_timer(hwnd, controller);
                         controller.ui_state.capture = StageStatus::Degraded;
                         controller.ui_state.upload = StageStatus::Degraded;
@@ -1236,6 +1527,11 @@ mod win32_ui {
                             EnableWindow(controller.controls.stop_button, 0);
                         }
                         log_error("capture_worker", "failure", &error);
+                        log_info(
+                            "perf",
+                            "capture_profile_summary",
+                            &controller.perf_stats.summary_line(),
+                        );
                     }
                 }
             }
@@ -1292,13 +1588,14 @@ mod win32_ui {
             set_control_text(
                 controller.controls.capture_status,
                 &format!(
-                    "Capture: {} | backend={} | running={} | buffered_frames={} | in_flight={} | interval_ms={}",
+                    "Capture: {} | backend={} | running={} | buffered_frames={} | in_flight={} | interval_ms={} | queue_wait_ms={}",
                     runtime.capture,
                     controller.capture_backend_name,
                     controller.capturing,
                     controller.frames_buffered,
                     controller.capture_tick_in_flight,
-                    controller.capture_timer_interval_ms
+                    controller.capture_timer_interval_ms,
+                    controller.current_queue_wait_ms
                 ),
             );
             set_control_text(
@@ -1319,9 +1616,10 @@ mod win32_ui {
             set_control_text(
                 controller.controls.frame_status,
                 &format!(
-                    "Frame: total={} | current_batch={}/9 | capture_ms={} | batch_prepare_ms={}",
+                    "Frame: total={} | current_batch={}/9 | queue_wait_ms={} | capture_ms={} | batch_prepare_ms={}",
                     controller.current_frame_number,
                     controller.frames_buffered,
+                    controller.current_queue_wait_ms,
                     controller.current_capture_duration_ms,
                     controller.current_encode_duration_ms
                 ),
@@ -1441,10 +1739,13 @@ mod win32_ui {
                 while let Ok(command) = command_rx.recv() {
                     match command {
                         WorkerCommand::CaptureTick {
+                            timer_tick_seq,
                             display_id,
                             session_id,
                             captured_at_ms,
+                            queued_at,
                         } => {
+                            let queue_wait_ms = queued_at.elapsed().as_millis();
                             let capture_started = Instant::now();
                             let frame =
                                 match capture_backend.capture_frame(&display_id, captured_at_ms) {
@@ -1473,8 +1774,10 @@ mod win32_ui {
                             let capture_duration_ms = capture_started.elapsed().as_millis();
 
                             let _ = event_tx.send(WorkerEvent::TickCaptured {
+                                timer_tick_seq,
                                 frame_number,
                                 buffered_frames,
+                                queue_wait_ms,
                                 capture_duration_ms,
                             });
                             notify_capture_worker_event(hwnd_value);
@@ -1504,6 +1807,7 @@ mod win32_ui {
 
                                 prepared_batches = prepared_batches.saturating_add(1);
                                 let _ = event_tx.send(WorkerEvent::BatchPrepared {
+                                    timer_tick_seq,
                                     frame_number,
                                     prepared_batches,
                                     mosaic_width: payload.mosaic_width,
@@ -1564,6 +1868,7 @@ mod win32_ui {
     }
 
     fn stage_payload_for_upload(payload: &MosaicPayload) -> Result<StagedPayloadArtifacts, String> {
+        let stage_started = Instant::now();
         let base_dir = runtime_artifact_dir()?;
         std::fs::create_dir_all(&base_dir)
             .map_err(|error| format!("artifact directory create failed: {error}"))?;
@@ -1571,9 +1876,15 @@ mod win32_ui {
         let stamp = timestamp_compact_utc();
         let jpeg_path = base_dir.join(format!("{stamp}_mosaic.jpg"));
         let json_path = base_dir.join(format!("{stamp}_payload.json"));
+
+        let rgb_convert_started = Instant::now();
         let mosaic_rgb = rgba_to_rgb(&payload.mosaic_rgba)?;
+        let rgba_to_rgb_ms = rgb_convert_started.elapsed().as_millis();
+        let raw_rgb_bytes = mosaic_rgb.len();
+
         let mut jpeg_bytes = Vec::new();
 
+        let jpeg_encode_started = Instant::now();
         image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_bytes, MOSAIC_JPEG_QUALITY)
             .encode(
                 &mosaic_rgb,
@@ -1582,11 +1893,16 @@ mod win32_ui {
                 image::ColorType::Rgb8.into(),
             )
             .map_err(|error| format!("jpeg encoding failed: {error}"))?;
+        let jpeg_encode_ms = jpeg_encode_started.elapsed().as_millis();
 
+        let disk_write_started = Instant::now();
         std::fs::write(&jpeg_path, &jpeg_bytes)
             .map_err(|error| format!("jpeg artifact write failed: {error}"))?;
         let jpeg_size_bytes = jpeg_bytes.len();
 
+        let json_encode_started = Instant::now();
+        let jpeg_base64 = base64::engine::general_purpose::STANDARD.encode(&jpeg_bytes);
+        let base64_size_chars = jpeg_base64.len();
         let payload_json = serde_json::json!({
             "schema_version": payload.schema_version,
             "metadata": payload.metadata,
@@ -1595,21 +1911,38 @@ mod win32_ui {
             "mosaic_format": "jpeg",
             "mosaic_color_space": "RGB",
             "mosaic_jpeg_quality": MOSAIC_JPEG_QUALITY,
-            "mosaic_jpeg_base64": base64::engine::general_purpose::STANDARD.encode(&jpeg_bytes),
+            "mosaic_jpeg_base64": jpeg_base64,
         });
         let payload_json = serde_json::to_vec(&payload_json)
             .map_err(|error| format!("json encode failed: {error}"))?;
+        let json_encode_ms = json_encode_started.elapsed().as_millis();
         let json_size_bytes = payload_json.len();
         std::fs::write(&json_path, payload_json)
             .map_err(|error| format!("json artifact write failed: {error}"))?;
+        let disk_write_ms = disk_write_started.elapsed().as_millis();
+
+        let preview_build_started = Instant::now();
         let preview_bitmap =
             build_preview_bitmap(&mosaic_rgb, payload.mosaic_width, payload.mosaic_height)?;
+        let preview_build_ms = preview_build_started.elapsed().as_millis();
+        let stage_total_ms = stage_started.elapsed().as_millis();
+        let stage_metrics = StageTimingMetrics {
+            rgba_to_rgb_ms,
+            jpeg_encode_ms,
+            json_encode_ms,
+            disk_write_ms,
+            preview_build_ms,
+            stage_total_ms,
+        };
 
         Ok(StagedPayloadArtifacts {
             jpeg_path,
             json_path,
             jpeg_size_bytes,
             json_size_bytes,
+            base64_size_chars,
+            raw_rgb_bytes,
+            stage_metrics,
             preview_bitmap,
         })
     }
@@ -1628,6 +1961,23 @@ mod win32_ui {
         }
 
         Ok(rgb)
+    }
+
+    fn average_ms(total: u128, count: u64) -> u128 {
+        if count == 0 { 0 } else { total / count as u128 }
+    }
+
+    fn average_u128(total: u128, count: u64) -> u128 {
+        if count == 0 { 0 } else { total / count as u128 }
+    }
+
+    fn compression_ratio(original_bytes: u128, reduced_bytes: u128) -> String {
+        if original_bytes == 0 || reduced_bytes == 0 {
+            return "n/a".to_string();
+        }
+
+        let ratio = original_bytes as f64 / reduced_bytes as f64;
+        format!("{ratio:.2}x")
     }
 
     fn build_preview_bitmap(
@@ -1812,8 +2162,13 @@ mod win32_ui {
 
         let logger = RunLogger::new()?;
         let path = logger.path.display().to_string();
+        let run_id = logger.run_id().to_string();
         let _ = RUN_LOGGER.set(logger);
-        log_info("logging", "file_created", &format!("log_file={path}"));
+        log_info(
+            "logging",
+            "file_created",
+            &format!("log_file={path} run_id={run_id}"),
+        );
         Ok(())
     }
 
