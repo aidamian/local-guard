@@ -626,3 +626,39 @@ Verification:
 
 Next:
 - Run manual capture cycle to confirm new staged `.jpg` + compact `.json` artifacts are produced after each 9-frame batch.
+
+## 2026-03-01 08:48 UTC | Phase 3/4/7 | Performance refactor + live frame/preview UX
+Objective:
+- Eliminate sluggish Win32 UI behavior by removing capture/mosaic/encoding work from the UI thread and add real-time frame + mosaic preview UX for manual diagnostics.
+
+Actions:
+- Critic C1: identified UI-thread blocking in `WM_TIMER` path (`capture_frame` + batch compose + JPEG encode + disk writes) and per-line file flush as primary responsiveness bottlenecks.
+- Builder B1 (`fixed`): introduced dedicated capture worker thread with command/event channels; UI timer now enqueues lightweight capture commands and returns immediately.
+- Critic C2: identified missing pipeline telemetry in UI (no current frame visibility, no visual mosaic confirmation) and expensive per-frame backend re-enumeration.
+- Builder B2 (`fixed`): added frame telemetry status line (`total frame`, `current batch index`, `capture ms`, `batch prepare ms`) and on-window reduced mosaic preview rendering via `StretchDIBits`.
+- Optimized real backend by caching `Screen` handles and refreshing only on topology/capture failure instead of calling `Screen::all()` every frame.
+- Reduced log I/O pressure by flushing run log immediately only on `ERROR` lines.
+- Rebuilt Win32 release binary and deployed refreshed executable to `dist/win32/local-guard-app.exe`.
+
+Files changed:
+- `crates/local-guard-app/src/main.rs`
+- `crates/local-guard-capture/src/lib.rs`
+- `DEVLOG.md`
+- `dist/win32/local-guard-app.exe`
+
+Commands run:
+- `cargo fmt --all`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo test --package local-guard-app`
+- `cargo test --package local-guard-capture`
+- `cargo build --release --target x86_64-pc-windows-gnu`
+- `cp -f target/x86_64-pc-windows-gnu/release/local-guard-app.exe dist/win32/local-guard-app.exe`
+- `sha256sum target/x86_64-pc-windows-gnu/release/local-guard-app.exe dist/win32/local-guard-app.exe`
+
+Verification:
+- Lint/tests passed after worker-thread and preview integration.
+- Windows GNU release build succeeded.
+- Deployed executable hash matches release build hash.
+
+Next:
+- Manual Windows run: verify UI remains responsive during continuous capture and that `prepared_uploads/` emits compact `.json` + `.jpg` while preview updates every completed 9-frame batch.

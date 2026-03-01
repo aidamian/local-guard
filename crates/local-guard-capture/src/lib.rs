@@ -85,9 +85,11 @@ pub trait CaptureBackend: Send + Sync {
 /// # Notes
 /// The backend snapshots display metadata at initialization and reacquires
 /// current screen handles for each capture call.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct RealCaptureBackend {
     displays: Vec<RealDisplayRecord>,
+    #[cfg(windows)]
+    screens: Mutex<Vec<screenshots::Screen>>,
 }
 
 #[derive(Debug, Clone)]
@@ -119,7 +121,7 @@ impl RealCaptureBackend {
             }
 
             let mut displays = Vec::with_capacity(screens.len());
-            for (index, screen) in screens.into_iter().enumerate() {
+            for (index, screen) in screens.iter().enumerate() {
                 let width = screen.display_info.width.max(1) as u32;
                 let height = screen.display_info.height.max(1) as u32;
                 displays.push(RealDisplayRecord {
@@ -134,7 +136,10 @@ impl RealCaptureBackend {
                 });
             }
 
-            Ok(Self { displays })
+            Ok(Self {
+                displays,
+                screens: Mutex::new(screens),
+            })
         }
 
         #[cfg(not(windows))]
@@ -165,9 +170,16 @@ impl CaptureBackend for RealCaptureBackend {
         {
             use screenshots::Screen;
 
-            let screens = Screen::all().map_err(|error| {
-                CaptureError::Backend(format!("screen refresh failed: {error}"))
-            })?;
+            let mut screens = self
+                .screens
+                .lock()
+                .map_err(|_| CaptureError::Backend("screen handle lock poisoned".to_string()))?;
+
+            if record.index >= screens.len() {
+                *screens = Screen::all().map_err(|error| {
+                    CaptureError::Backend(format!("screen refresh failed: {error}"))
+                })?;
+            }
             let screen = screens.get(record.index).ok_or_else(|| {
                 CaptureError::Backend(format!(
                     "display index {} is not available anymore",
@@ -175,9 +187,26 @@ impl CaptureBackend for RealCaptureBackend {
                 ))
             })?;
 
-            let captured = screen.capture().map_err(|error| {
-                CaptureError::Backend(format!("screen capture failed: {error}"))
-            })?;
+            let captured = match screen.capture() {
+                Ok(captured) => captured,
+                Err(first_error) => {
+                    *screens = Screen::all().map_err(|error| {
+                        CaptureError::Backend(format!("screen refresh failed: {error}"))
+                    })?;
+                    let refreshed_screen = screens.get(record.index).ok_or_else(|| {
+                        CaptureError::Backend(format!(
+                            "display index {} is not available after refresh",
+                            record.index
+                        ))
+                    })?;
+
+                    refreshed_screen.capture().map_err(|retry_error| {
+                        CaptureError::Backend(format!(
+                            "screen capture failed (initial: {first_error}; retry: {retry_error})"
+                        ))
+                    })?
+                }
+            };
             let width = captured.width();
             let height = captured.height();
             let rgba = captured.into_raw();

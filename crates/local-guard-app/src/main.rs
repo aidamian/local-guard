@@ -35,8 +35,10 @@ mod win32_ui {
     use std::path::PathBuf;
     use std::ptr::{null, null_mut};
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
     use std::sync::{Arc, Mutex, OnceLock};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::thread::JoinHandle;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     use base64::Engine as _;
     use local_guard_app::{
@@ -51,7 +53,10 @@ mod win32_ui {
     use local_guard_ui::{StageStatus, UiAuthState, UiState};
     use time::OffsetDateTime;
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-    use windows_sys::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
+    use windows_sys::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, COLOR_WINDOW, DIB_RGB_COLORS, EndPaint,
+        InvalidateRect, PAINTSTRUCT, SRCCOPY, StretchDIBits,
+    };
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::Controls::{BST_CHECKED, BST_UNCHECKED};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
@@ -60,9 +65,10 @@ mod win32_ui {
         CB_GETCURSEL, CB_SETCURSEL, CBN_SELCHANGE, CBS_DROPDOWNLIST, CS_HREDRAW, CS_VREDRAW,
         CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DispatchMessageW, ES_AUTOHSCROLL,
         ES_PASSWORD, GetMessageW, GetWindowTextLengthW, GetWindowTextW, IDC_ARROW, KillTimer,
-        LoadCursorW, MSG, PostQuitMessage, RegisterClassW, SW_SHOW, SendMessageW, SetTimer,
-        SetWindowTextW, ShowWindow, TranslateMessage, WM_COMMAND, WM_DESTROY, WM_PAINT, WM_TIMER,
-        WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+        LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SW_SHOW, SendMessageW,
+        SetTimer, SetWindowTextW, ShowWindow, TranslateMessage, WM_APP, WM_COMMAND, WM_DESTROY,
+        WM_PAINT, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
+        WS_VISIBLE, WS_VSCROLL,
     };
 
     const CONTROL_ID_USERNAME_EDIT: i32 = 1001;
@@ -72,10 +78,18 @@ mod win32_ui {
     const CONTROL_ID_DISPLAY_COMBO: i32 = 1005;
     const CONTROL_ID_START_BUTTON: i32 = 1006;
     const CONTROL_ID_STOP_BUTTON: i32 = 1007;
+    const CONTROL_ID_FRAME_STATUS: i32 = 1008;
 
     const TIMER_CAPTURE_ID: usize = 1;
     const DEFAULT_CAPTURE_FPS: u32 = 1;
     const MOSAIC_JPEG_QUALITY: u8 = 9;
+    const PREVIEW_MAX_WIDTH: u32 = 300;
+    const PREVIEW_MAX_HEIGHT: u32 = 170;
+    const PREVIEW_DRAW_X: i32 = 20;
+    const PREVIEW_DRAW_Y: i32 = 500;
+    const PREVIEW_DRAW_WIDTH: i32 = 300;
+    const PREVIEW_DRAW_HEIGHT: i32 = 170;
+    const WM_CAPTURE_WORKER_EVENT: u32 = WM_APP + 1;
 
     const AUTH_ENDPOINT: &str = "https://auth.local-guard.test/r1/cstore-auth";
     static RUN_LOGGER: OnceLock<RunLogger> = OnceLock::new();
@@ -121,7 +135,9 @@ mod win32_ui {
 
             if let Ok(mut file) = self.file.lock() {
                 let _ = file.write_all(line.as_bytes());
-                let _ = file.flush();
+                if level == "ERROR" {
+                    let _ = file.flush();
+                }
             }
         }
     }
@@ -142,23 +158,77 @@ mod win32_ui {
         upload_status: HWND,
         analysis_status: HWND,
         pipeline_status: HWND,
+        frame_status: HWND,
+    }
+
+    /// Small BGR24 bitmap used for on-window preview rendering.
+    struct PreviewBitmap {
+        width: i32,
+        height: i32,
+        bgr24: Vec<u8>,
+    }
+
+    /// Files staged for later upload plus lightweight preview bytes.
+    struct StagedPayloadArtifacts {
+        jpeg_path: PathBuf,
+        json_path: PathBuf,
+        jpeg_size_bytes: usize,
+        json_size_bytes: usize,
+        preview_bitmap: PreviewBitmap,
+    }
+
+    enum WorkerCommand {
+        CaptureTick {
+            display_id: String,
+            session_id: String,
+            captured_at_ms: u64,
+        },
+        ResetBatch,
+        Shutdown,
+    }
+
+    enum WorkerEvent {
+        TickCaptured {
+            frame_number: u64,
+            buffered_frames: usize,
+            capture_duration_ms: u128,
+        },
+        BatchPrepared {
+            frame_number: u64,
+            prepared_batches: u64,
+            mosaic_width: u32,
+            mosaic_height: u32,
+            encode_duration_ms: u128,
+            artifacts: StagedPayloadArtifacts,
+        },
+        WorkerError(String),
+    }
+
+    struct CaptureWorkerRuntime {
+        command_tx: Sender<WorkerCommand>,
+        event_rx: Receiver<WorkerEvent>,
+        worker_join: JoinHandle<()>,
     }
 
     struct AppController {
         ui_state: UiState,
         auth_machine: AuthStateMachine,
         session_token: Option<SessionToken>,
-        capture_backend: Box<dyn CaptureBackend>,
-        frame_batch: FrameBatch,
         displays: Vec<DisplayInfo>,
         controls: ControlHandles,
         capturing: bool,
+        capture_tick_in_flight: bool,
         capture_timer_interval_ms: u32,
+        current_frame_number: u64,
+        current_capture_duration_ms: u128,
+        current_encode_duration_ms: u128,
         frames_buffered: usize,
         prepared_batches: u64,
         capture_backend_name: String,
         last_prepared_jpeg: Option<PathBuf>,
         last_prepared_json: Option<PathBuf>,
+        preview_bitmap: Option<PreviewBitmap>,
+        worker_runtime: Option<CaptureWorkerRuntime>,
     }
 
     impl AppController {
@@ -179,18 +249,21 @@ mod win32_ui {
                 ui_state,
                 auth_machine: AuthStateMachine::new(),
                 session_token: None,
-                capture_backend: Box::new(capture_backend),
-                frame_batch: FrameBatch::new(9)
-                    .map_err(|error| format!("frame batch initialization failed: {error}"))?,
                 displays,
                 controls: ControlHandles::default(),
                 capturing: false,
+                capture_tick_in_flight: false,
                 capture_timer_interval_ms: 1_000,
+                current_frame_number: 0,
+                current_capture_duration_ms: 0,
+                current_encode_duration_ms: 0,
                 frames_buffered: 0,
                 prepared_batches: 0,
                 capture_backend_name: "real".to_string(),
                 last_prepared_jpeg: None,
                 last_prepared_json: None,
+                preview_bitmap: None,
+                worker_runtime: None,
             })
         }
     }
@@ -262,6 +335,7 @@ mod win32_ui {
             hInstance: instance,
             lpszClassName: class_name.as_ptr(),
             hCursor: cursor,
+            hbrBackground: (COLOR_WINDOW as usize + 1) as *mut c_void,
             ..unsafe {
                 // Safety:
                 // - Zero-initialization for unused optional fields is valid.
@@ -370,6 +444,10 @@ mod win32_ui {
                 }
                 0
             }
+            WM_CAPTURE_WORKER_EVENT => {
+                handle_capture_worker_events(hwnd);
+                0
+            }
             WM_PAINT => {
                 if !FIRST_PAINT_LOGGED.swap(true, Ordering::Relaxed) {
                     log_info("ui", "first_paint", "first paint message processed");
@@ -383,7 +461,8 @@ mod win32_ui {
                 unsafe {
                     // Safety:
                     // - `hwnd` is provided by Win32 for paint processing.
-                    BeginPaint(hwnd, &mut paint);
+                    let paint_hdc = BeginPaint(hwnd, &mut paint);
+                    draw_preview_bitmap(paint_hdc);
                     EndPaint(hwnd, &paint);
                 }
                 0
@@ -391,6 +470,7 @@ mod win32_ui {
             WM_DESTROY => {
                 let _ = with_controller_mut(|controller| {
                     stop_capture_timer(hwnd, controller);
+                    shutdown_capture_worker(controller);
                     Ok(())
                 });
                 log_info("ui", "destroy", "window destroyed; posting quit");
@@ -661,6 +741,31 @@ mod win32_ui {
                 22,
                 0,
             )?;
+            controls.frame_status = create_child_control(
+                hwnd,
+                instance,
+                "STATIC",
+                "",
+                static_style,
+                20,
+                414,
+                920,
+                22,
+                CONTROL_ID_FRAME_STATUS,
+            )?;
+
+            let _preview_label = create_child_control(
+                hwnd,
+                instance,
+                "STATIC",
+                "Latest 3x3 mosaic preview (reduced):",
+                static_style,
+                PREVIEW_DRAW_X,
+                470,
+                360,
+                22,
+                0,
+            )?;
 
             unsafe {
                 // Safety:
@@ -862,20 +967,36 @@ mod win32_ui {
                 );
             }
 
+            ensure_capture_worker(controller, hwnd)?;
+
             let fps = capture_fps_from_env();
             let interval_ms = (1_000 / fps.max(1)).max(1);
+            if let Some(worker) = controller.worker_runtime.as_ref() {
+                worker
+                    .command_tx
+                    .send(WorkerCommand::ResetBatch)
+                    .map_err(|error| format!("capture worker reset command failed: {error}"))?;
+            }
 
-            controller.frame_batch =
-                FrameBatch::new(9).map_err(|error| format!("frame batch reset failed: {error}"))?;
+            controller.current_frame_number = 0;
+            controller.current_capture_duration_ms = 0;
+            controller.current_encode_duration_ms = 0;
             controller.frames_buffered = 0;
             controller.prepared_batches = 0;
             controller.last_prepared_jpeg = None;
             controller.last_prepared_json = None;
+            controller.preview_bitmap = None;
+            controller.capture_tick_in_flight = false;
             controller.ui_state.capture = StageStatus::Running;
             controller.ui_state.network = StageStatus::Idle;
             controller.ui_state.upload = StageStatus::Idle;
             controller.ui_state.analysis_status =
                 "Capture started. Preparing first 9-frame mosaic.".to_string();
+            unsafe {
+                // Safety:
+                // - Invalidating client rect triggers redraw and clears old preview.
+                InvalidateRect(hwnd, null(), 0);
+            }
 
             let timer = unsafe {
                 // Safety:
@@ -901,7 +1022,7 @@ mod win32_ui {
                 "capture",
                 "start",
                 &format!(
-                    "fps={fps} interval_ms={interval_ms} backend={}",
+                    "fps={fps} interval_ms={interval_ms} backend={} worker=enabled",
                     controller.capture_backend_name
                 ),
             );
@@ -912,6 +1033,12 @@ mod win32_ui {
     fn handle_stop_capture(hwnd: HWND) -> Result<(), String> {
         with_controller_mut(|controller| {
             stop_capture_timer(hwnd, controller);
+            if let Some(worker) = controller.worker_runtime.as_ref() {
+                let _ = worker.command_tx.send(WorkerCommand::ResetBatch);
+            }
+
+            controller.capture_tick_in_flight = false;
+            controller.frames_buffered = 0;
             controller.ui_state.capture = StageStatus::Idle;
             controller.ui_state.analysis_status = "Capture stopped.".to_string();
 
@@ -959,80 +1086,36 @@ mod win32_ui {
                 .clone()
                 .ok_or_else(|| "no display selected for capture tick".to_string())?;
 
-            let frame = controller
-                .capture_backend
-                .capture_frame(&selected_display, unix_timestamp_millis() as u64)
-                .map_err(|error| format!("frame capture failed: {error}"))?;
-
-            let maybe_batch = controller
-                .frame_batch
-                .push_frame(frame)
-                .map_err(|error| format!("frame batch push failed: {error}"))?;
-            controller.frames_buffered = controller.frame_batch.len();
-
-            log_info(
-                "capture",
-                "frame_acquired",
-                &format!(
-                    "display={} buffered_frames={}",
-                    selected_display, controller.frames_buffered
-                ),
-            );
-
-            if let Some(batch) = maybe_batch {
-                controller.ui_state.upload = StageStatus::Running;
-                controller.ui_state.network = StageStatus::Idle;
-
-                let session = controller
-                    .session_token
-                    .as_ref()
-                    .ok_or_else(|| "missing session token for payload preparation".to_string())?;
-
-                let payload = batch_to_payload(&batch, &session.session_id)
-                    .map_err(|error| format!("batch-to-payload failed: {error}"))?;
-
+            if controller.capture_tick_in_flight {
                 log_info(
-                    "mosaic",
-                    "payload_ready",
-                    &format!(
-                        "width={} height={} rgba_bytes={}",
-                        payload.mosaic_width,
-                        payload.mosaic_height,
-                        payload.mosaic_rgba.len()
-                    ),
+                    "capture",
+                    "tick_skipped",
+                    "worker is still processing previous tick",
                 );
-
-                match stage_payload_for_upload(&payload) {
-                    Ok((jpeg_path, json_path)) => {
-                        controller.ui_state.upload = StageStatus::Healthy;
-                        controller.prepared_batches = controller.prepared_batches.saturating_add(1);
-                        controller.last_prepared_jpeg = Some(jpeg_path.clone());
-                        controller.last_prepared_json = Some(json_path.clone());
-                        controller.ui_state.analysis_status = format!(
-                            "Prepared batch #{} for upload (endpoint not configured).",
-                            controller.prepared_batches
-                        );
-
-                        log_info(
-                            "upload_prep",
-                            "artifact_ready",
-                            &format!(
-                                "prepared_batches={} jpeg={} json={}",
-                                controller.prepared_batches,
-                                jpeg_path.display(),
-                                json_path.display()
-                            ),
-                        );
-                    }
-                    Err(error) => {
-                        controller.ui_state.upload = StageStatus::Degraded;
-                        controller.ui_state.analysis_status =
-                            "Failed to prepare upload artifact.".to_string();
-                        log_error("upload_prep", "artifact_failed", &error);
-                    }
-                }
+                return Ok(());
             }
 
+            let session = controller
+                .session_token
+                .as_ref()
+                .ok_or_else(|| "missing session token for payload preparation".to_string())?;
+
+            let command = WorkerCommand::CaptureTick {
+                display_id: selected_display,
+                session_id: session.session_id.clone(),
+                captured_at_ms: unix_timestamp_millis() as u64,
+            };
+            let worker = controller
+                .worker_runtime
+                .as_ref()
+                .ok_or_else(|| "capture worker is not initialized".to_string())?;
+            worker
+                .command_tx
+                .send(command)
+                .map_err(|error| format!("capture worker send failed: {error}"))?;
+
+            controller.capture_tick_in_flight = true;
+            controller.ui_state.upload = StageStatus::Running;
             Ok(())
         });
 
@@ -1042,6 +1125,138 @@ mod win32_ui {
                 stop_capture_timer(hwnd, controller);
                 controller.ui_state.capture = StageStatus::Degraded;
                 controller.ui_state.analysis_status = format!("Capture error: {error}");
+                unsafe {
+                    // Safety:
+                    // - Start/stop handles are valid.
+                    EnableWindow(controller.controls.start_button, 1);
+                    EnableWindow(controller.controls.stop_button, 0);
+                }
+                Ok(())
+            });
+        }
+
+        let _ = refresh_status_texts();
+    }
+
+    fn handle_capture_worker_events(hwnd: HWND) {
+        let result = with_controller_mut(|controller| {
+            let mut drained_events = Vec::new();
+            {
+                let Some(worker) = controller.worker_runtime.as_ref() else {
+                    return Ok(());
+                };
+
+                loop {
+                    match worker.event_rx.try_recv() {
+                        Ok(event) => drained_events.push(event),
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            return Err("capture worker channel disconnected".to_string());
+                        }
+                    }
+                }
+            }
+
+            let mut preview_changed = false;
+            for event in drained_events {
+                match event {
+                    WorkerEvent::TickCaptured {
+                        frame_number,
+                        buffered_frames,
+                        capture_duration_ms,
+                    } => {
+                        controller.capture_tick_in_flight = false;
+                        controller.current_frame_number = frame_number;
+                        controller.frames_buffered = buffered_frames;
+                        controller.current_capture_duration_ms = capture_duration_ms;
+                        controller.ui_state.analysis_status = format!(
+                            "Captured frame {} (batch position {}/9).",
+                            frame_number,
+                            buffered_frames.max(1)
+                        );
+
+                        log_info(
+                            "capture",
+                            "frame_acquired",
+                            &format!(
+                                "frame={} buffered_frames={} capture_ms={}",
+                                frame_number, buffered_frames, capture_duration_ms
+                            ),
+                        );
+                    }
+                    WorkerEvent::BatchPrepared {
+                        frame_number,
+                        prepared_batches,
+                        mosaic_width,
+                        mosaic_height,
+                        encode_duration_ms,
+                        artifacts,
+                    } => {
+                        controller.current_frame_number = frame_number;
+                        controller.current_encode_duration_ms = encode_duration_ms;
+                        controller.prepared_batches = prepared_batches;
+                        controller.frames_buffered = 0;
+                        controller.last_prepared_jpeg = Some(artifacts.jpeg_path.clone());
+                        controller.last_prepared_json = Some(artifacts.json_path.clone());
+                        controller.preview_bitmap = Some(artifacts.preview_bitmap);
+                        controller.ui_state.upload = StageStatus::Healthy;
+                        controller.ui_state.analysis_status = format!(
+                            "Prepared batch #{} for upload ({}x{}, jpeg={} bytes, json={} bytes).",
+                            prepared_batches,
+                            mosaic_width,
+                            mosaic_height,
+                            artifacts.jpeg_size_bytes,
+                            artifacts.json_size_bytes
+                        );
+                        preview_changed = true;
+
+                        log_info(
+                            "upload_prep",
+                            "artifact_ready",
+                            &format!(
+                                "prepared_batches={} jpeg={} json={} encode_ms={}",
+                                prepared_batches,
+                                artifacts.jpeg_path.display(),
+                                artifacts.json_path.display(),
+                                encode_duration_ms
+                            ),
+                        );
+                    }
+                    WorkerEvent::WorkerError(error) => {
+                        controller.capture_tick_in_flight = false;
+                        stop_capture_timer(hwnd, controller);
+                        controller.ui_state.capture = StageStatus::Degraded;
+                        controller.ui_state.upload = StageStatus::Degraded;
+                        controller.ui_state.analysis_status =
+                            "Capture pipeline failed. Review log for details.".to_string();
+                        unsafe {
+                            // Safety:
+                            // - Start/stop handles are valid.
+                            EnableWindow(controller.controls.start_button, 1);
+                            EnableWindow(controller.controls.stop_button, 0);
+                        }
+                        log_error("capture_worker", "failure", &error);
+                    }
+                }
+            }
+
+            if preview_changed {
+                unsafe {
+                    // Safety:
+                    // - Invalidating client rect asks the window to repaint preview region.
+                    InvalidateRect(hwnd, null(), 0);
+                }
+            }
+
+            Ok(())
+        });
+
+        if let Err(error) = result {
+            log_error("capture_worker", "event_drain", &error);
+            let _ = with_controller_mut(|controller| {
+                stop_capture_timer(hwnd, controller);
+                controller.ui_state.capture = StageStatus::Degraded;
+                controller.ui_state.analysis_status = format!("Capture worker error: {error}");
                 unsafe {
                     // Safety:
                     // - Start/stop handles are valid.
@@ -1077,11 +1292,12 @@ mod win32_ui {
             set_control_text(
                 controller.controls.capture_status,
                 &format!(
-                    "Capture: {} | backend={} | running={} | buffered_frames={} | interval_ms={}",
+                    "Capture: {} | backend={} | running={} | buffered_frames={} | in_flight={} | interval_ms={}",
                     runtime.capture,
                     controller.capture_backend_name,
                     controller.capturing,
                     controller.frames_buffered,
+                    controller.capture_tick_in_flight,
                     controller.capture_timer_interval_ms
                 ),
             );
@@ -1099,6 +1315,16 @@ mod win32_ui {
             set_control_text(
                 controller.controls.analysis_status,
                 &format!("Analysis: {}", runtime.analysis),
+            );
+            set_control_text(
+                controller.controls.frame_status,
+                &format!(
+                    "Frame: total={} | current_batch={}/9 | capture_ms={} | batch_prepare_ms={}",
+                    controller.current_frame_number,
+                    controller.frames_buffered,
+                    controller.current_capture_duration_ms,
+                    controller.current_encode_duration_ms
+                ),
             );
 
             let selected_display = controller
@@ -1161,6 +1387,161 @@ mod win32_ui {
         }
     }
 
+    fn ensure_capture_worker(controller: &mut AppController, hwnd: HWND) -> Result<(), String> {
+        if controller.worker_runtime.is_some() {
+            return Ok(());
+        }
+
+        let worker_runtime = spawn_capture_worker(hwnd)?;
+        controller.worker_runtime = Some(worker_runtime);
+        log_info("capture_worker", "spawned", "worker thread initialized");
+        Ok(())
+    }
+
+    fn shutdown_capture_worker(controller: &mut AppController) {
+        if let Some(worker_runtime) = controller.worker_runtime.take() {
+            let _ = worker_runtime.command_tx.send(WorkerCommand::Shutdown);
+            let _ = worker_runtime.worker_join.join();
+            log_info("capture_worker", "shutdown", "worker thread joined");
+        }
+    }
+
+    fn spawn_capture_worker(hwnd: HWND) -> Result<CaptureWorkerRuntime, String> {
+        let (command_tx, command_rx) = mpsc::channel::<WorkerCommand>();
+        let (event_tx, event_rx) = mpsc::channel::<WorkerEvent>();
+        let hwnd_value = hwnd as isize;
+
+        let worker_join = std::thread::Builder::new()
+            .name("local-guard-capture-worker".to_string())
+            .spawn(move || {
+                let capture_backend = match RealCaptureBackend::discover() {
+                    Ok(backend) => backend,
+                    Err(error) => {
+                        let _ = event_tx.send(WorkerEvent::WorkerError(format!(
+                            "capture backend initialization failed: {error}"
+                        )));
+                        notify_capture_worker_event(hwnd_value);
+                        return;
+                    }
+                };
+                let mut frame_batch = match FrameBatch::new(9) {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        let _ = event_tx.send(WorkerEvent::WorkerError(format!(
+                            "frame batch initialization failed: {error}"
+                        )));
+                        notify_capture_worker_event(hwnd_value);
+                        return;
+                    }
+                };
+
+                let mut frame_number: u64 = 0;
+                let mut prepared_batches: u64 = 0;
+
+                while let Ok(command) = command_rx.recv() {
+                    match command {
+                        WorkerCommand::CaptureTick {
+                            display_id,
+                            session_id,
+                            captured_at_ms,
+                        } => {
+                            let capture_started = Instant::now();
+                            let frame =
+                                match capture_backend.capture_frame(&display_id, captured_at_ms) {
+                                    Ok(frame) => frame,
+                                    Err(error) => {
+                                        let _ = event_tx.send(WorkerEvent::WorkerError(format!(
+                                            "frame capture failed: {error}"
+                                        )));
+                                        notify_capture_worker_event(hwnd_value);
+                                        continue;
+                                    }
+                                };
+
+                            let maybe_batch = match frame_batch.push_frame(frame) {
+                                Ok(maybe_batch) => maybe_batch,
+                                Err(error) => {
+                                    let _ = event_tx.send(WorkerEvent::WorkerError(format!(
+                                        "frame batch push failed: {error}"
+                                    )));
+                                    notify_capture_worker_event(hwnd_value);
+                                    continue;
+                                }
+                            };
+                            frame_number = frame_number.saturating_add(1);
+                            let buffered_frames = frame_batch.len();
+                            let capture_duration_ms = capture_started.elapsed().as_millis();
+
+                            let _ = event_tx.send(WorkerEvent::TickCaptured {
+                                frame_number,
+                                buffered_frames,
+                                capture_duration_ms,
+                            });
+                            notify_capture_worker_event(hwnd_value);
+
+                            if let Some(batch) = maybe_batch {
+                                let prepare_started = Instant::now();
+                                let payload = match batch_to_payload(&batch, &session_id) {
+                                    Ok(payload) => payload,
+                                    Err(error) => {
+                                        let _ = event_tx.send(WorkerEvent::WorkerError(format!(
+                                            "batch-to-payload failed: {error}"
+                                        )));
+                                        notify_capture_worker_event(hwnd_value);
+                                        continue;
+                                    }
+                                };
+                                let staged = match stage_payload_for_upload(&payload) {
+                                    Ok(staged) => staged,
+                                    Err(error) => {
+                                        let _ = event_tx.send(WorkerEvent::WorkerError(format!(
+                                            "artifact staging failed: {error}"
+                                        )));
+                                        notify_capture_worker_event(hwnd_value);
+                                        continue;
+                                    }
+                                };
+
+                                prepared_batches = prepared_batches.saturating_add(1);
+                                let _ = event_tx.send(WorkerEvent::BatchPrepared {
+                                    frame_number,
+                                    prepared_batches,
+                                    mosaic_width: payload.mosaic_width,
+                                    mosaic_height: payload.mosaic_height,
+                                    encode_duration_ms: prepare_started.elapsed().as_millis(),
+                                    artifacts: staged,
+                                });
+                                notify_capture_worker_event(hwnd_value);
+                            }
+                        }
+                        WorkerCommand::ResetBatch => {
+                            frame_number = 0;
+                            prepared_batches = 0;
+                            if let Ok(new_batch) = FrameBatch::new(9) {
+                                frame_batch = new_batch;
+                            }
+                        }
+                        WorkerCommand::Shutdown => break,
+                    }
+                }
+            })
+            .map_err(|error| format!("failed to spawn capture worker thread: {error}"))?;
+
+        Ok(CaptureWorkerRuntime {
+            command_tx,
+            event_rx,
+            worker_join,
+        })
+    }
+
+    fn notify_capture_worker_event(hwnd_value: isize) {
+        unsafe {
+            // Safety:
+            // - Posts a custom message to the UI thread queue; no pointers are transferred.
+            PostMessageW(hwnd_value as HWND, WM_CAPTURE_WORKER_EVENT, 0, 0);
+        }
+    }
+
     fn with_controller_mut<F, T>(f: F) -> Result<T, String>
     where
         F: FnOnce(&mut AppController) -> Result<T, String>,
@@ -1182,7 +1563,7 @@ mod win32_ui {
             .unwrap_or(DEFAULT_CAPTURE_FPS)
     }
 
-    fn stage_payload_for_upload(payload: &MosaicPayload) -> Result<(PathBuf, PathBuf), String> {
+    fn stage_payload_for_upload(payload: &MosaicPayload) -> Result<StagedPayloadArtifacts, String> {
         let base_dir = runtime_artifact_dir()?;
         std::fs::create_dir_all(&base_dir)
             .map_err(|error| format!("artifact directory create failed: {error}"))?;
@@ -1204,6 +1585,7 @@ mod win32_ui {
 
         std::fs::write(&jpeg_path, &jpeg_bytes)
             .map_err(|error| format!("jpeg artifact write failed: {error}"))?;
+        let jpeg_size_bytes = jpeg_bytes.len();
 
         let payload_json = serde_json::json!({
             "schema_version": payload.schema_version,
@@ -1217,10 +1599,19 @@ mod win32_ui {
         });
         let payload_json = serde_json::to_vec(&payload_json)
             .map_err(|error| format!("json encode failed: {error}"))?;
+        let json_size_bytes = payload_json.len();
         std::fs::write(&json_path, payload_json)
             .map_err(|error| format!("json artifact write failed: {error}"))?;
+        let preview_bitmap =
+            build_preview_bitmap(&mosaic_rgb, payload.mosaic_width, payload.mosaic_height)?;
 
-        Ok((jpeg_path, json_path))
+        Ok(StagedPayloadArtifacts {
+            jpeg_path,
+            json_path,
+            jpeg_size_bytes,
+            json_size_bytes,
+            preview_bitmap,
+        })
     }
 
     fn rgba_to_rgb(rgba: &[u8]) -> Result<Vec<u8>, String> {
@@ -1237,6 +1628,97 @@ mod win32_ui {
         }
 
         Ok(rgb)
+    }
+
+    fn build_preview_bitmap(
+        mosaic_rgb: &[u8],
+        mosaic_width: u32,
+        mosaic_height: u32,
+    ) -> Result<PreviewBitmap, String> {
+        let source_image =
+            image::RgbImage::from_raw(mosaic_width, mosaic_height, mosaic_rgb.to_vec())
+                .ok_or_else(|| {
+                    format!(
+                        "failed to construct RGB image buffer {}x{}",
+                        mosaic_width, mosaic_height
+                    )
+                })?;
+
+        let x_scale = PREVIEW_MAX_WIDTH as f32 / mosaic_width.max(1) as f32;
+        let y_scale = PREVIEW_MAX_HEIGHT as f32 / mosaic_height.max(1) as f32;
+        let scale = x_scale.min(y_scale).max(0.001);
+        let target_width = (mosaic_width as f32 * scale).round().max(1.0) as u32;
+        let target_height = (mosaic_height as f32 * scale).round().max(1.0) as u32;
+
+        let preview_image = image::imageops::resize(
+            &source_image,
+            target_width,
+            target_height,
+            image::imageops::FilterType::Triangle,
+        );
+
+        let mut bgr24 = Vec::with_capacity((target_width as usize) * (target_height as usize) * 3);
+        for pixel in preview_image.pixels() {
+            let [r, g, b] = pixel.0;
+            bgr24.extend_from_slice(&[b, g, r]);
+        }
+
+        Ok(PreviewBitmap {
+            width: target_width as i32,
+            height: target_height as i32,
+            bgr24,
+        })
+    }
+
+    fn draw_preview_bitmap(paint_hdc: *mut c_void) {
+        let _ = with_controller_mut(|controller| {
+            let Some(preview_bitmap) = controller.preview_bitmap.as_ref() else {
+                return Ok(());
+            };
+
+            let mut bitmap_info: BITMAPINFO = unsafe {
+                // Safety:
+                // - Zeroed `BITMAPINFO` is a valid baseline before header assignment.
+                std::mem::zeroed()
+            };
+            bitmap_info.bmiHeader = BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: preview_bitmap.width,
+                // Negative height marks top-down row order.
+                biHeight: -preview_bitmap.height,
+                biPlanes: 1,
+                biBitCount: 24,
+                biCompression: BI_RGB,
+                ..unsafe {
+                    // Safety:
+                    // - Remaining fields are optional for BI_RGB source buffers.
+                    std::mem::zeroed()
+                }
+            };
+
+            unsafe {
+                // Safety:
+                // - Preview buffer remains alive for the duration of the call.
+                // - BITMAPINFO header matches BGR24 top-down memory layout.
+                StretchDIBits(
+                    paint_hdc,
+                    PREVIEW_DRAW_X,
+                    PREVIEW_DRAW_Y,
+                    PREVIEW_DRAW_WIDTH,
+                    PREVIEW_DRAW_HEIGHT,
+                    0,
+                    0,
+                    preview_bitmap.width,
+                    preview_bitmap.height,
+                    preview_bitmap.bgr24.as_ptr() as *const c_void,
+                    &bitmap_info,
+                    DIB_RGB_COLORS,
+                    SRCCOPY,
+                );
+            }
+
+            Ok(())
+        });
     }
 
     fn runtime_artifact_dir() -> Result<PathBuf, String> {
