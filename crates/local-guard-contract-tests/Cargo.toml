@@ -1,0 +1,10 @@
+[package]
+name = "local-guard-contract-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+jsonschema.workspace = true
+serde_json.workspace = true

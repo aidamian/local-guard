@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local-guard.dev/contracts/ingest-request.v1.schema.json",
+  "title": "local-guard ingest request",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "metadata",
+    "mosaic_width",
+    "mosaic_height",
+    "mosaic_rgba"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "v1"
+    },
+    "metadata": {
+      "type": "object",
+      "required": [
+        "start_timestamp_ms",
+        "end_timestamp_ms",
+        "screen_id",
+        "source_width",
+        "source_height",
+        "session_id",
+        "frame_count"
+      ],
+      "properties": {
+        "start_timestamp_ms": { "type": "integer", "minimum": 0 },
+        "end_timestamp_ms": { "type": "integer", "minimum": 0 },
+        "screen_id": { "type": "string", "minLength": 1 },
+        "source_width": { "type": "integer", "minimum": 1 },
+        "source_height": { "type": "integer", "minimum": 1 },
+        "session_id": { "type": "string", "minLength": 1 },
+        "frame_count": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "mosaic_width": { "type": "integer", "minimum": 1 },
+    "mosaic_height": { "type": "integer", "minimum": 1 },
+    "mosaic_rgba": {
+      "type": "array",
+      "items": { "type": "integer", "minimum": 0, "maximum": 255 },
+      "minItems": 4
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,35 @@
+[package]
+name = "local-guard-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+build = "build.rs"
+
+[dependencies]
+local-guard-analysis-contract = { path = "../local-guard-analysis-contract" }
+local-guard-auth = { path = "../local-guard-auth" }
+local-guard-capture = { path = "../local-guard-capture" }
+local-guard-core = { path = "../local-guard-core" }
+local-guard-mosaic = { path = "../local-guard-mosaic" }
+local-guard-ui = { path = "../local-guard-ui" }
+local-guard-upload = { path = "../local-guard-upload" }
+thiserror.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+base64 = "0.22.1"
+image = { version = "0.25.8", default-features = false, features = ["jpeg"] }
+serde_json.workspace = true
+time = { version = "0.3.47", default-features = false, features = ["formatting", "std"] }
+windows-sys = { version = "0.60.2", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_System_LibraryLoader",
+  "Win32_UI_Controls",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+] }

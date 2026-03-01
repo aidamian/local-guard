@@ -1,0 +1,30 @@
+[workspace]
+members = [
+  "crates/local-guard-core",
+  "crates/local-guard-auth",
+  "crates/local-guard-capture",
+  "crates/local-guard-mosaic",
+  "crates/local-guard-upload",
+  "crates/local-guard-analysis-contract",
+  "crates/local-guard-ui",
+  "crates/local-guard-app",
+  "crates/local-guard-contract-tests",
+  "crates/local-guard-benchmarks",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["local-guard contributors"]
+
+[workspace.dependencies]
+hex = "0.4.3"
+jsonschema = "0.18.3"
+rand = { version = "0.9.2", default-features = false, features = ["std", "std_rng"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+thiserror = "2.0.16"
+url = "2.5.7"

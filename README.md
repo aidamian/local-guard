@@ -70,4 +70,17 @@ ls -lh dist/win32
 
 ## Current status
 
-The repository currently contains project documentation and environment bootstrap. Implementation should follow the execution roadmap in `TODO.md`.
+MVP workspace implementation is in place with crate boundaries for:
+
+- `local-guard-core`
+- `local-guard-auth`
+- `local-guard-capture`
+- `local-guard-mosaic`
+- `local-guard-upload`
+- `local-guard-analysis-contract`
+- `local-guard-ui`
+- `local-guard-app`
+- `local-guard-contract-tests`
+- `local-guard-benchmarks`
+
+Phase verification commands in `TODO.md` have been executed with passing results, including rustdoc/clippy gates and Windows GNU cross-build artifact output in `dist/win32/`.

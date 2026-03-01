@@ -1,0 +1,15 @@
+{
+  "schema_version": "v1",
+  "metadata": {
+    "start_timestamp_ms": 1000,
+    "end_timestamp_ms": 9000,
+    "screen_id": "display-1",
+    "source_width": 1920,
+    "source_height": 1080,
+    "session_id": "session-abc",
+    "frame_count": 9
+  },
+  "mosaic_width": 5760,
+  "mosaic_height": 3240,
+  "mosaic_rgba": [0, 0, 0, 255]
+}

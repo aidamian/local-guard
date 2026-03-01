@@ -1,0 +1,11 @@
+[package]
+name = "local-guard-benchmarks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+local-guard-core = { path = "../local-guard-core" }
+local-guard-mosaic = { path = "../local-guard-mosaic" }
+local-guard-upload = { path = "../local-guard-upload" }
