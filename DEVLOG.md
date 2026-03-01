@@ -662,3 +662,49 @@ Verification:
 
 Next:
 - Manual Windows run: verify UI remains responsive during continuous capture and that `prepared_uploads/` emits compact `.json` + `.jpg` while preview updates every completed 9-frame batch.
+
+## 2026-03-01 11:21 UTC | Phase 7/8/9 | Profiling-grade runtime telemetry expansion
+Objective:
+- Add richer logs/timings/size metrics to support post-run profiling, debugging, benchmarking, and regression analysis from user-shared log files.
+
+Actions:
+- Extended run-log envelope with `run_id`, `uptime_ms`, `pid`, `thread`, and `thread id` in every line.
+- Added startup telemetry logs for runtime config (`capture_fps`, JPEG quality, preview dimensions, endpoint, executable path) and display inventory.
+- Added structured capture tick telemetry (`tick_seq`, dispatch/skip counters, selected display, queue wait).
+- Added worker event timings and counters: queue wait, capture duration, batch prepare duration, worker event/error totals.
+- Added full staging timing breakdown per batch:
+  - `rgba_to_rgb_ms`
+  - `jpeg_encode_ms`
+  - `json_encode_ms`
+  - `disk_write_ms`
+  - `preview_build_ms`
+  - `stage_total_ms`
+- Added payload size/compression telemetry per batch:
+  - `raw_rgb_bytes`
+  - `jpeg_size_bytes`
+  - `base64_size_chars`
+  - `json_size_bytes`
+  - computed ratios for JPEG and base64.
+- Added periodic performance snapshots (every 5 prepared batches) and mandatory summary logs on stop/error/window-destroy.
+- Rebuilt release executable and replaced `dist/win32/local-guard-app.exe`.
+
+Files changed:
+- `crates/local-guard-app/src/main.rs`
+- `DEVLOG.md`
+- `dist/win32/local-guard-app.exe`
+
+Commands run:
+- `cargo fmt --all`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo test --package local-guard-app`
+- `cargo build --release --target x86_64-pc-windows-gnu`
+- `cp -f target/x86_64-pc-windows-gnu/release/local-guard-app.exe dist/win32/local-guard-app.exe`
+- `sha256sum target/x86_64-pc-windows-gnu/release/local-guard-app.exe dist/win32/local-guard-app.exe`
+
+Verification:
+- Lint/tests passed with new telemetry fields and worker message schema updates.
+- Windows release build succeeded.
+- Deployed executable hash matches freshly built release hash.
+
+Next:
+- User to run manual capture session and share generated log file for profiling/regression analysis.
