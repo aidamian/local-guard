@@ -759,3 +759,35 @@ Verification:
 
 Next:
 - Run another manual session and share the new log so queue-depth trends, capture lag, stage queue wait, and process CPU/RAM snapshots can be compared against the prior baseline.
+
+## 2026-03-02 06:48 UTC | Phase 9 | README citation + VERSION-triggered win32 release automation
+Objective:
+- Document latest optimization summary as key repository information and add release automation that tags/builds/releases only when `VERSION` changes.
+
+Actions:
+- Updated `README.md` with a new `Citation` section at the end and added a BibTeX software citation for this repository.
+- Added `.github/workflows/version-release-win32.yml`:
+  - Trigger: `push` on `main/master` with `paths: [VERSION]` only.
+  - Reads and validates semantic tag from `VERSION`.
+  - Creates/pushes git tag when missing.
+  - Builds Windows release binary (`x86_64-pc-windows-msvc`).
+  - Publishes/updates GitHub release and uploads win32 executable asset.
+
+Files changed:
+- `README.md`
+- `.github/workflows/version-release-win32.yml`
+- `DEVLOG.md`
+
+Commands run:
+- `cat README.md`
+- `cat .github/workflows/ci.yml`
+- `git remote -v`
+- `date -u +"%Y-%m-%d %H:%M UTC"`
+
+Verification:
+- Workflow trigger scope is constrained to `VERSION` path changes only.
+- Workflow content includes tag creation + win32 build + GitHub release publish steps.
+- README now includes BibTeX citation at the end.
+
+Next:
+- On next `VERSION` bump commit merged to `main/master`, verify the workflow creates the expected tag and publishes win32 release asset.

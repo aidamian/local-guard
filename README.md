@@ -84,3 +84,35 @@ MVP workspace implementation is in place with crate boundaries for:
 - `local-guard-benchmarks`
 
 Phase verification commands in `TODO.md` have been executed with passing results, including rustdoc/clippy gates and Windows GNU cross-build artifact output in `dist/win32/`.
+
+## Latest optimizations (March 2026)
+
+Recent changes focused on runtime responsiveness, payload efficiency, and profiling depth for manual QA and regression analysis:
+
+- Dual-worker runtime pipeline in `local-guard-app`:
+  - Capture worker handles frame acquisition + 9-frame batching.
+  - Stage worker handles mosaic preparation, JPEG/base64 encoding, preview generation, and disk staging.
+- UI thread de-blocking:
+  - Win32 `WM_TIMER` path now dispatches lightweight capture commands instead of doing heavy image/IO work inline.
+- Payload compaction:
+  - Staged mosaics are JPEG (`quality=9`, `RGB`) and payload JSON stores base64 JPEG instead of raw RGBA arrays.
+- Live diagnostics in UI:
+  - Current frame/batch counters, queue wait/capture lag timings, and reduced-size mosaic preview are shown at runtime.
+- Profiling-grade logs:
+  - Per-run log now includes queue depths, capture lag, per-stage timing breakdowns, payload-size ratios, periodic summaries, and final run summaries.
+  - Process snapshots include CPU estimate and memory/pagefile usage fields for benchmark and regression comparisons.
+
+## Citation
+
+If you use this project in research, tooling comparisons, or internal reports, cite it as:
+
+```bibtex
+@software{local_guard_2026,
+  title = {local-guard},
+  author = {Andrei Damian, Cristi Balaci},
+  year = {2026},
+  version = {v0.2.1},
+  url = {https://github.com/aidamian/local-guard},
+  note = {Rust desktop agent for secure temporal screen-mosaic capture and delivery}
+}
+```

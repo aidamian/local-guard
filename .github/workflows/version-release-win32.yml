@@ -1,0 +1,70 @@
+name: version-release-win32
+
+on:
+  push:
+    branches: ["main", "master"]
+    paths:
+      - VERSION
+
+permissions:
+  contents: write
+
+jobs:
+  tag-build-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve version from VERSION file
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="$(tr -d '\r\n' < VERSION)"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "VERSION must match vMAJOR.MINOR.PATCH, got: $TAG"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "asset_name=local-guard-app-${TAG}-win32-x64.exe" >> "$GITHUB_OUTPUT"
+
+      - name: Create git tag when missing
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.tag }}"
+          git fetch --tags --force
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists; reusing existing tag."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG" -m "Release $TAG"
+            git push origin "$TAG"
+          fi
+
+      - name: Build win32 release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --target x86_64-pc-windows-msvc
+          mkdir -p dist/win32
+          cp -f target/x86_64-pc-windows-msvc/release/local-guard-app.exe "dist/win32/${{ steps.version.outputs.asset_name }}"
+
+      - name: Publish GitHub release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          artifacts: dist/win32/${{ steps.version.outputs.asset_name }}
+          artifactErrorsFailBuild: true
+          allowUpdates: true
+          replacesArtifacts: true
+          generateReleaseNotes: true
