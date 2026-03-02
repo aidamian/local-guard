@@ -12,28 +12,25 @@ permissions:
 jobs:
   tag-build-release:
     # Linux/macOS release lanes are defined but paused.
-    if: ${{ matrix.enabled == true }}
     strategy:
       matrix:
         include:
           - os: windows-latest
-            enabled: true
             target: x86_64-pc-windows-msvc
             platform_id: win32-x64
             binary_path: target/x86_64-pc-windows-msvc/release/local-guard-app.exe
             artifact_ext: exe
-          - os: ubuntu-latest
-            enabled: false
-            target: x86_64-unknown-linux-gnu
-            platform_id: ubuntu-x64
-            binary_path: target/x86_64-unknown-linux-gnu/release/local-guard-app
-            artifact_ext: tar.gz
-          - os: macos-latest
-            enabled: false
-            target: x86_64-apple-darwin
-            platform_id: macos-x64
-            binary_path: target/x86_64-apple-darwin/release/local-guard-app
-            artifact_ext: tar.gz
+        # Paused lanes (uncomment to re-enable):
+        #   - os: ubuntu-latest
+        #     target: x86_64-unknown-linux-gnu
+        #     platform_id: ubuntu-x64
+        #     binary_path: target/x86_64-unknown-linux-gnu/release/local-guard-app
+        #     artifact_ext: tar.gz
+        #   - os: macos-latest
+        #     target: x86_64-apple-darwin
+        #     platform_id: macos-x64
+        #     binary_path: target/x86_64-apple-darwin/release/local-guard-app
+        #     artifact_ext: tar.gz
     runs-on: ${{ matrix.os }}
 
     steps:

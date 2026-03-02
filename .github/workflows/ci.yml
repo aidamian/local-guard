@@ -12,16 +12,13 @@ on:
 jobs:
   build-and-test:
     # Non-Windows runners are intentionally paused for now.
-    if: ${{ matrix.enabled == true }}
     strategy:
       matrix:
         include:
           - os: windows-latest
-            enabled: true
-          - os: ubuntu-latest
-            enabled: false
-          - os: macos-latest
-            enabled: false
+        # Paused lanes (uncomment to re-enable):
+        #   - os: ubuntu-latest
+        #   - os: macos-latest
     runs-on: ${{ matrix.os }}
 
     steps:

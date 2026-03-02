@@ -901,3 +901,35 @@ Verification:
 
 Next:
 - Apply this validation gate automatically for every subsequent code-edit turn.
+
+## 2026-03-02 07:17 UTC | Phase 9 | Fix invalid GitHub Actions matrix context usage
+Objective:
+- Resolve GitHub Actions parse failures in `ci.yml` and `version-release-win32.yml` caused by `matrix` usage in a job-level `if` expression.
+
+Actions:
+- Removed job-level `if: ${{ matrix.enabled == true }}` from both workflows.
+- Simplified each matrix to active Windows lane(s) only.
+- Preserved paused Linux/macOS lanes as commented matrix entries for quick re-enable.
+- Confirmed no remaining `matrix.enabled` references in either workflow.
+
+Files changed:
+- `.github/workflows/ci.yml`
+- `.github/workflows/version-release-win32.yml`
+- `DEVLOG.md`
+
+Commands run:
+- `nl -ba .github/workflows/version-release-win32.yml | sed -n '1,140p'`
+- `nl -ba .github/workflows/ci.yml | sed -n '1,180p'`
+- `cargo fmt --all`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo test --workspace`
+- `cargo build --release --target x86_64-pc-windows-gnu`
+- `rg -n "matrix\\.enabled|if:\\s*\\$\\{\\{\\s*matrix" .github/workflows/ci.yml .github/workflows/version-release-win32.yml`
+
+Verification:
+- Workflow parse issue root cause removed (`matrix` no longer referenced in job-level `if`).
+- `cargo fmt --all` passed.
+- `cargo clippy`, `cargo test --workspace`, and `cargo build --release --target x86_64-pc-windows-gnu` failed in this container with filesystem error `Invalid cross-device link (os error 18)` while rustc wrote `.rmeta` artifacts.
+
+Next:
+- Re-run the three failing cargo commands in CI or on a local filesystem without the current mount/linking limitation to confirm full gate success.
