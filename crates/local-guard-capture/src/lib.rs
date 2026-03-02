@@ -122,8 +122,8 @@ impl RealCaptureBackend {
 
             let mut displays = Vec::with_capacity(screens.len());
             for (index, screen) in screens.iter().enumerate() {
-                let width = screen.display_info.width.max(1) as u32;
-                let height = screen.display_info.height.max(1) as u32;
+                let width = screen.display_info.width.max(1);
+                let height = screen.display_info.height.max(1);
                 displays.push(RealDisplayRecord {
                     #[cfg(windows)]
                     index,
@@ -211,8 +211,8 @@ impl CaptureBackend for RealCaptureBackend {
             let height = captured.height();
             let rgba = captured.into_raw();
 
-            return Frame::new(record.info.id.clone(), width, height, captured_at_ms, rgba)
-                .map_err(|error| CaptureError::Backend(error.to_string()));
+            Frame::new(record.info.id.clone(), width, height, captured_at_ms, rgba)
+                .map_err(|error| CaptureError::Backend(error.to_string()))
         }
 
         #[cfg(not(windows))]

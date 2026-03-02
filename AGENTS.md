@@ -52,6 +52,17 @@ Method references (used to shape this protocol):
 - For risky decisions, add a lightweight spike/prototype command before committing to full implementation.
 - When assumptions remain, track them in `TODO.md` as explicit risks with owner + next action.
 
+## Post-modification validation gate (mandatory)
+
+After every code modification (including agent-generated edits), run the following commands before handoff:
+
+- `cargo fmt --all`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo test --workspace`
+- `cargo build --release --target x86_64-pc-windows-gnu`
+
+Any failure must be fixed or explicitly documented with rationale before the task is considered complete.
+
 ## Documentation-first coding standard (mandatory)
 
 Assume the primary maintainer has strong `C++`/`Python`/`Pascal` OOP experience and near-zero Rust familiarity.

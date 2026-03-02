@@ -847,3 +847,57 @@ Verification:
 
 Next:
 - Confirm desired behavior by opening a PR that changes only non-`VERSION` files and verifying CI does not trigger.
+
+## 2026-03-02 07:09 UTC | Phase 9 | CI clippy fix for local-guard-capture (Windows runner)
+Objective:
+- Resolve GitHub Actions clippy failures reported for `local-guard-capture` on unnecessary casts and needless return.
+
+Actions:
+- Removed redundant `as u32` casts in display enumeration (`width` and `height`).
+- Removed needless explicit `return` in Windows capture path and returned expression directly.
+
+Files changed:
+- `crates/local-guard-capture/src/lib.rs`
+- `DEVLOG.md`
+
+Commands run:
+- `cargo clippy --package local-guard-capture --all-targets --all-features -- -D warnings`
+- `cargo test --package local-guard-capture`
+- `date -u +"%Y-%m-%d %H:%M UTC"`
+
+Verification:
+- Clippy passes for `local-guard-capture` with `-D warnings`.
+- Package tests pass.
+
+Next:
+- Re-run the GitHub Actions workflow to confirm the prior failure is resolved in CI.
+
+## 2026-03-02 07:12 UTC | Phase 9 | AGENTS validation-gate enforcement rule
+Objective:
+- Add explicit contributor/agent rule requiring format/lint/test/build execution after every code modification.
+
+Actions:
+- Added new `Post-modification validation gate (mandatory)` section to `AGENTS.md`.
+- Added required commands list:
+  - `cargo fmt --all`
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  - `cargo test --workspace`
+  - `cargo build --release --target x86_64-pc-windows-gnu`
+- Added completion rule that failures must be fixed or explicitly documented before handoff.
+- Executed the full validation sequence immediately after updating `AGENTS.md`.
+
+Files changed:
+- `AGENTS.md`
+- `DEVLOG.md`
+
+Commands run:
+- `cargo fmt --all`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo test --workspace`
+- `cargo build --release --target x86_64-pc-windows-gnu`
+
+Verification:
+- All four required commands completed successfully.
+
+Next:
+- Apply this validation gate automatically for every subsequent code-edit turn.
