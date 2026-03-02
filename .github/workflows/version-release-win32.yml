@@ -1,4 +1,4 @@
-name: version-release-win32
+name: version-release
 
 on:
   push:
@@ -11,7 +11,30 @@ permissions:
 
 jobs:
   tag-build-release:
-    runs-on: windows-latest
+    # Linux/macOS release lanes are defined but paused.
+    if: ${{ matrix.enabled == true }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            enabled: true
+            target: x86_64-pc-windows-msvc
+            platform_id: win32-x64
+            binary_path: target/x86_64-pc-windows-msvc/release/local-guard-app.exe
+            artifact_ext: exe
+          - os: ubuntu-latest
+            enabled: false
+            target: x86_64-unknown-linux-gnu
+            platform_id: ubuntu-x64
+            binary_path: target/x86_64-unknown-linux-gnu/release/local-guard-app
+            artifact_ext: tar.gz
+          - os: macos-latest
+            enabled: false
+            target: x86_64-apple-darwin
+            platform_id: macos-x64
+            binary_path: target/x86_64-apple-darwin/release/local-guard-app
+            artifact_ext: tar.gz
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout
@@ -32,8 +55,13 @@ jobs:
             echo "VERSION must match vMAJOR.MINOR.PATCH, got: $TAG"
             exit 1
           fi
+          if [[ "${{ matrix.artifact_ext }}" == "exe" ]]; then
+            ASSET_NAME="local-guard-app-${TAG}-${{ matrix.platform_id }}.exe"
+          else
+            ASSET_NAME="local-guard-app-${TAG}-${{ matrix.platform_id }}.tar.gz"
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "asset_name=local-guard-app-${TAG}-win32-x64.exe" >> "$GITHUB_OUTPUT"
+          echo "asset_name=$ASSET_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Create git tag when missing
         shell: bash
@@ -50,20 +78,26 @@ jobs:
             git push origin "$TAG"
           fi
 
-      - name: Build win32 release binary
+      - name: Build release binary
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --release --target x86_64-pc-windows-msvc
-          mkdir -p dist/win32
-          cp -f target/x86_64-pc-windows-msvc/release/local-guard-app.exe "dist/win32/${{ steps.version.outputs.asset_name }}"
+          cargo build --release --target "${{ matrix.target }}"
+          mkdir -p dist/release-assets
+          if [[ "${{ matrix.artifact_ext }}" == "exe" ]]; then
+            cp -f "${{ matrix.binary_path }}" "dist/release-assets/${{ steps.version.outputs.asset_name }}"
+          else
+            BIN_DIR="$(dirname "${{ matrix.binary_path }}")"
+            BIN_FILE="$(basename "${{ matrix.binary_path }}")"
+            tar -czf "dist/release-assets/${{ steps.version.outputs.asset_name }}" -C "$BIN_DIR" "$BIN_FILE"
+          fi
 
       - name: Publish GitHub release
         uses: ncipollo/release-action@v1
         with:
           tag: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.tag }}
-          artifacts: dist/win32/${{ steps.version.outputs.asset_name }}
+          artifacts: dist/release-assets/${{ steps.version.outputs.asset_name }}
           artifactErrorsFailBuild: true
           allowUpdates: true
           replacesArtifacts: true

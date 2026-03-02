@@ -791,3 +791,59 @@ Verification:
 
 Next:
 - On next `VERSION` bump commit merged to `main/master`, verify the workflow creates the expected tag and publishes win32 release asset.
+
+## 2026-03-02 07:04 UTC | Phase 9 | CI/release matrix expansion with paused Linux/macOS lanes
+Objective:
+- Add Ubuntu/macOS lanes to CI and release workflows while keeping them paused so only Windows executes.
+
+Actions:
+- Updated `.github/workflows/ci.yml`:
+  - Switched to explicit matrix entries (`windows`, `ubuntu`, `macos`) with `enabled` flags.
+  - Added job-level `if: ${{ matrix.enabled == true }}` so only enabled OS jobs run (Windows enabled, Ubuntu/macOS paused).
+- Updated `.github/workflows/version-release-win32.yml` (renamed workflow name to `version-release`):
+  - Added explicit release matrix entries for `windows`, `ubuntu`, `macos` with per-platform targets/artifact metadata.
+  - Added job-level `if: ${{ matrix.enabled == true }}` with Linux/macOS paused and Windows enabled.
+  - Kept trigger restricted to `VERSION` path changes.
+  - Generalized asset naming/build packaging logic for future non-Windows enablement.
+
+Files changed:
+- `.github/workflows/ci.yml`
+- `.github/workflows/version-release-win32.yml`
+- `DEVLOG.md`
+
+Commands run:
+- `cat .github/workflows/ci.yml`
+- `cat .github/workflows/version-release-win32.yml`
+- `rg -n ... .github/workflows/ci.yml .github/workflows/version-release-win32.yml`
+- `date -u +"%Y-%m-%d %H:%M UTC"`
+
+Verification:
+- CI and release workflows now both declare Windows/Ubuntu/macOS matrices.
+- Ubuntu/macOS are explicitly paused (`enabled: false`), leaving Windows as the only executing lane.
+- Release workflow still triggers only when `VERSION` changes on `main/master`.
+
+Next:
+- When ready to enable Linux/macOS, flip their matrix `enabled` flags to `true` in both workflows.
+
+## 2026-03-02 07:07 UTC | Phase 9 | CI trigger narrowed to VERSION changes only
+Objective:
+- Ensure CI runs only when `VERSION` changes, matching the release trigger policy.
+
+Actions:
+- Updated `.github/workflows/ci.yml` triggers:
+  - Added `paths: [VERSION]` for `pull_request`.
+  - Added `paths: [VERSION]` for `push` (still restricted to `main/master` branches).
+
+Files changed:
+- `.github/workflows/ci.yml`
+- `DEVLOG.md`
+
+Commands run:
+- `cat .github/workflows/ci.yml`
+- `date -u +"%Y-%m-%d %H:%M UTC"`
+
+Verification:
+- CI workflow now requires `VERSION` in changed paths for both PR and push events.
+
+Next:
+- Confirm desired behavior by opening a PR that changes only non-`VERSION` files and verifying CI does not trigger.

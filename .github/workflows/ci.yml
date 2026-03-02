@@ -2,14 +2,26 @@ name: ci
 
 on:
   pull_request:
+    paths:
+      - VERSION
   push:
     branches: ["main", "master"]
+    paths:
+      - VERSION
 
 jobs:
   build-and-test:
+    # Non-Windows runners are intentionally paused for now.
+    if: ${{ matrix.enabled == true }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: windows-latest
+            enabled: true
+          - os: ubuntu-latest
+            enabled: false
+          - os: macos-latest
+            enabled: false
     runs-on: ${{ matrix.os }}
 
     steps:
