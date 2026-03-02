@@ -708,3 +708,54 @@ Verification:
 
 Next:
 - User to run manual capture session and share generated log file for profiling/regression analysis.
+
+## 2026-03-02 00:53 UTC | Phase 3/7/8/9 | Dual-worker pipeline + deeper profiling telemetry
+Objective:
+- Implement requested one-pass optimization set: split capture/staging workers, reduce preview CPU cost, and expand telemetry with lag/queue-depth/process snapshots for stronger profiling and regression analysis.
+
+Actions:
+- Replaced single worker with dual-worker architecture:
+  - Capture worker handles frame acquisition + batch assembly only.
+  - Stage worker handles payload compose/staging (mosaic/JPEG/base64/JSON/preview/disk).
+  - Added explicit stage command channel and coordinated shutdown/reset flow.
+- Added queue depth instrumentation using atomics:
+  - `pending_capture_queue`
+  - `pending_stage_queue`
+  and wired metrics into dispatch, skip, capture, and staging logs.
+- Added per-frame telemetry fields:
+  - captured frame dimensions (`frame_size=WxH`)
+  - `capture_lag_ms` (`actual_capture_time - scheduled_tick_time`)
+  - queue wait at capture worker ingress.
+- Added stage-queue wait telemetry (`stage_queue_wait_ms`) and integrated it into per-batch logs and summary aggregates.
+- Added process-level snapshot data to periodic/final perf summaries:
+  - cumulative process CPU percent (`proc_cpu_total_pct`)
+  - working set / peak working set / pagefile bytes
+  - logical CPU count.
+- Reduced preview rendering cost:
+  - lowered preview target dimensions to `220x124`,
+  - switched resize filter to `Nearest`,
+  - draws at actual preview bitmap dimensions (bounded by draw box).
+- Kept final summary logs on stop/error/destroy, now including process snapshot fields.
+- Rebuilt and deployed updated Win32 executable.
+
+Files changed:
+- `crates/local-guard-app/src/main.rs`
+- `crates/local-guard-app/Cargo.toml`
+- `DEVLOG.md`
+- `dist/win32/local-guard-app.exe`
+
+Commands run:
+- `cargo fmt --all`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo test --package local-guard-app`
+- `cargo build --release --target x86_64-pc-windows-gnu`
+- `cp -f target/x86_64-pc-windows-gnu/release/local-guard-app.exe dist/win32/local-guard-app.exe`
+- `sha256sum target/x86_64-pc-windows-gnu/release/local-guard-app.exe dist/win32/local-guard-app.exe`
+
+Verification:
+- Formatting/lint/tests pass after dual-worker and telemetry schema changes.
+- Windows GNU release build succeeded.
+- Deployed executable hash matches built release executable hash.
+
+Next:
+- Run another manual session and share the new log so queue-depth trends, capture lag, stage queue wait, and process CPU/RAM snapshots can be compared against the prior baseline.

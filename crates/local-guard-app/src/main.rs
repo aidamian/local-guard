@@ -34,7 +34,7 @@ mod win32_ui {
     use std::io::Write;
     use std::path::PathBuf;
     use std::ptr::{null, null_mut};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread::JoinHandle;
@@ -49,15 +49,19 @@ mod win32_ui {
         LoginRequest, LoginResponse, SessionToken,
     };
     use local_guard_capture::{CaptureBackend, DisplayInfo, RealCaptureBackend};
-    use local_guard_core::{FrameBatch, MosaicPayload};
+    use local_guard_core::{Frame, FrameBatch, MosaicPayload};
     use local_guard_ui::{StageStatus, UiAuthState, UiState};
     use time::OffsetDateTime;
-    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows_sys::Win32::Foundation::{FILETIME, HWND, LPARAM, LRESULT, WPARAM};
     use windows_sys::Win32::Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, COLOR_WINDOW, DIB_RGB_COLORS, EndPaint,
         InvalidateRect, PAINTSTRUCT, SRCCOPY, StretchDIBits,
     };
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
     use windows_sys::Win32::UI::Controls::{BST_CHECKED, BST_UNCHECKED};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -83,12 +87,12 @@ mod win32_ui {
     const TIMER_CAPTURE_ID: usize = 1;
     const DEFAULT_CAPTURE_FPS: u32 = 1;
     const MOSAIC_JPEG_QUALITY: u8 = 9;
-    const PREVIEW_MAX_WIDTH: u32 = 300;
-    const PREVIEW_MAX_HEIGHT: u32 = 170;
+    const PREVIEW_MAX_WIDTH: u32 = 220;
+    const PREVIEW_MAX_HEIGHT: u32 = 124;
     const PREVIEW_DRAW_X: i32 = 20;
     const PREVIEW_DRAW_Y: i32 = 500;
-    const PREVIEW_DRAW_WIDTH: i32 = 300;
-    const PREVIEW_DRAW_HEIGHT: i32 = 170;
+    const PREVIEW_DRAW_WIDTH: i32 = 220;
+    const PREVIEW_DRAW_HEIGHT: i32 = 124;
     const WM_CAPTURE_WORKER_EVENT: u32 = WM_APP + 1;
 
     const AUTH_ENDPOINT: &str = "https://auth.local-guard.test/r1/cstore-auth";
@@ -220,6 +224,18 @@ mod win32_ui {
         Shutdown,
     }
 
+    enum StageCommand {
+        PrepareBatch {
+            timer_tick_seq: u64,
+            frame_number: u64,
+            session_id: String,
+            batch: Vec<Frame>,
+            queued_at: Instant,
+        },
+        ResetBatch,
+        Shutdown,
+    }
+
     enum WorkerEvent {
         TickCaptured {
             timer_tick_seq: u64,
@@ -227,6 +243,11 @@ mod win32_ui {
             buffered_frames: usize,
             queue_wait_ms: u128,
             capture_duration_ms: u128,
+            capture_lag_ms: u128,
+            frame_width: u32,
+            frame_height: u32,
+            pending_capture_queue: usize,
+            pending_stage_queue: usize,
         },
         BatchPrepared {
             timer_tick_seq: u64,
@@ -234,7 +255,9 @@ mod win32_ui {
             prepared_batches: u64,
             mosaic_width: u32,
             mosaic_height: u32,
-            encode_duration_ms: u128,
+            batch_prepare_ms: u128,
+            stage_queue_wait_ms: u128,
+            pending_stage_queue: usize,
             artifacts: StagedPayloadArtifacts,
         },
         WorkerError(String),
@@ -243,7 +266,10 @@ mod win32_ui {
     struct CaptureWorkerRuntime {
         command_tx: Sender<WorkerCommand>,
         event_rx: Receiver<WorkerEvent>,
-        worker_join: JoinHandle<()>,
+        pending_capture_commands: Arc<AtomicUsize>,
+        pending_stage_batches: Arc<AtomicUsize>,
+        capture_worker_join: JoinHandle<()>,
+        stage_worker_join: JoinHandle<()>,
     }
 
     #[derive(Default)]
@@ -257,12 +283,20 @@ mod win32_ui {
         batches_prepared_total: u64,
         queue_wait_ms_total: u128,
         queue_wait_ms_max: u128,
+        stage_queue_wait_ms_total: u128,
+        stage_queue_wait_ms_max: u128,
         capture_ms_total: u128,
         capture_ms_max: u128,
+        capture_lag_ms_total: u128,
+        capture_lag_ms_max: u128,
         batch_prepare_ms_total: u128,
         batch_prepare_ms_max: u128,
         stage_total_ms_total: u128,
         stage_total_ms_max: u128,
+        frame_width_last: u32,
+        frame_height_last: u32,
+        capture_queue_depth_max: usize,
+        stage_queue_depth_max: usize,
         jpeg_bytes_total: u128,
         json_bytes_total: u128,
         raw_rgb_bytes_total: u128,
@@ -275,6 +309,10 @@ mod win32_ui {
             let avg_capture_ms = average_ms(self.capture_ms_total, self.frames_captured_total);
             let avg_queue_wait_ms =
                 average_ms(self.queue_wait_ms_total, self.frames_captured_total);
+            let avg_stage_queue_wait_ms =
+                average_ms(self.stage_queue_wait_ms_total, self.batches_prepared_total);
+            let avg_capture_lag_ms =
+                average_ms(self.capture_lag_ms_total, self.frames_captured_total);
             let avg_batch_prepare_ms =
                 average_ms(self.batch_prepare_ms_total, self.batches_prepared_total);
             let avg_stage_total_ms =
@@ -287,7 +325,7 @@ mod win32_ui {
                 compression_ratio(self.raw_rgb_bytes_total, self.base64_chars_total);
 
             format!(
-                "ticks_total={} ticks_dispatched={} ticks_skipped={} frames={} batches={} worker_events={} worker_errors={} avg_queue_wait_ms={} max_queue_wait_ms={} avg_capture_ms={} max_capture_ms={} avg_batch_prepare_ms={} max_batch_prepare_ms={} avg_stage_total_ms={} max_stage_total_ms={} avg_jpeg_bytes={} avg_json_bytes={} total_raw_rgb_bytes={} total_jpeg_bytes={} total_base64_chars={} overall_jpeg_ratio={} overall_base64_ratio={}",
+                "ticks_total={} ticks_dispatched={} ticks_skipped={} frames={} batches={} worker_events={} worker_errors={} avg_queue_wait_ms={} max_queue_wait_ms={} avg_stage_queue_wait_ms={} max_stage_queue_wait_ms={} avg_capture_ms={} max_capture_ms={} avg_capture_lag_ms={} max_capture_lag_ms={} avg_batch_prepare_ms={} max_batch_prepare_ms={} avg_stage_total_ms={} max_stage_total_ms={} frame_last={}x{} capture_queue_depth_max={} stage_queue_depth_max={} avg_jpeg_bytes={} avg_json_bytes={} total_raw_rgb_bytes={} total_jpeg_bytes={} total_base64_chars={} overall_jpeg_ratio={} overall_base64_ratio={}",
                 self.timer_ticks_total,
                 self.timer_ticks_dispatched,
                 self.timer_ticks_skipped,
@@ -297,12 +335,20 @@ mod win32_ui {
                 self.worker_errors_total,
                 avg_queue_wait_ms,
                 self.queue_wait_ms_max,
+                avg_stage_queue_wait_ms,
+                self.stage_queue_wait_ms_max,
                 avg_capture_ms,
                 self.capture_ms_max,
+                avg_capture_lag_ms,
+                self.capture_lag_ms_max,
                 avg_batch_prepare_ms,
                 self.batch_prepare_ms_max,
                 avg_stage_total_ms,
                 self.stage_total_ms_max,
+                self.frame_width_last,
+                self.frame_height_last,
+                self.capture_queue_depth_max,
+                self.stage_queue_depth_max,
                 avg_jpeg_bytes,
                 avg_json_bytes,
                 self.raw_rgb_bytes_total,
@@ -327,6 +373,7 @@ mod win32_ui {
         current_frame_number: u64,
         current_capture_duration_ms: u128,
         current_queue_wait_ms: u128,
+        current_capture_lag_ms: u128,
         current_encode_duration_ms: u128,
         frames_buffered: usize,
         prepared_batches: u64,
@@ -365,6 +412,7 @@ mod win32_ui {
                 current_frame_number: 0,
                 current_capture_duration_ms: 0,
                 current_queue_wait_ms: 0,
+                current_capture_lag_ms: 0,
                 current_encode_duration_ms: 0,
                 frames_buffered: 0,
                 prepared_batches: 0,
@@ -612,7 +660,7 @@ mod win32_ui {
                     log_info(
                         "perf",
                         "capture_profile_summary",
-                        &controller.perf_stats.summary_line(),
+                        &summary_with_process_snapshot(&controller.perf_stats),
                     );
                     shutdown_capture_worker(controller);
                     Ok(())
@@ -1125,6 +1173,7 @@ mod win32_ui {
             controller.current_frame_number = 0;
             controller.current_capture_duration_ms = 0;
             controller.current_queue_wait_ms = 0;
+            controller.current_capture_lag_ms = 0;
             controller.current_encode_duration_ms = 0;
             controller.timer_tick_seq = 0;
             controller.frames_buffered = 0;
@@ -1198,6 +1247,7 @@ mod win32_ui {
             controller.capture_tick_in_flight = false;
             controller.frames_buffered = 0;
             controller.current_queue_wait_ms = 0;
+            controller.current_capture_lag_ms = 0;
             controller.ui_state.capture = StageStatus::Idle;
             controller.ui_state.analysis_status = "Capture stopped.".to_string();
 
@@ -1212,7 +1262,7 @@ mod win32_ui {
             log_info(
                 "perf",
                 "capture_profile_summary",
-                &controller.perf_stats.summary_line(),
+                &summary_with_process_snapshot(&controller.perf_stats),
             );
             Ok(())
         })
@@ -1256,13 +1306,25 @@ mod win32_ui {
             if controller.capture_tick_in_flight {
                 controller.perf_stats.timer_ticks_skipped =
                     controller.perf_stats.timer_ticks_skipped.saturating_add(1);
+                let (pending_capture_queue, pending_stage_queue) = controller
+                    .worker_runtime
+                    .as_ref()
+                    .map(|worker| {
+                        (
+                            worker.pending_capture_commands.load(Ordering::Relaxed),
+                            worker.pending_stage_batches.load(Ordering::Relaxed),
+                        )
+                    })
+                    .unwrap_or((0, 0));
                 log_info(
                     "capture",
                     "tick_skipped",
                     &format!(
-                        "reason=in_flight skipped_total={} last_tick_seq={}",
+                        "reason=in_flight skipped_total={} last_tick_seq={} pending_capture_queue={} pending_stage_queue={}",
                         controller.perf_stats.timer_ticks_skipped,
-                        controller.perf_stats.last_tick_seq
+                        controller.perf_stats.last_tick_seq,
+                        pending_capture_queue,
+                        pending_stage_queue
                     ),
                 );
                 return Ok(());
@@ -1287,9 +1349,16 @@ mod win32_ui {
                 .as_ref()
                 .ok_or_else(|| "capture worker is not initialized".to_string())?;
             worker
-                .command_tx
-                .send(command)
-                .map_err(|error| format!("capture worker send failed: {error}"))?;
+                .pending_capture_commands
+                .fetch_add(1, Ordering::Relaxed);
+            if let Err(error) = worker.command_tx.send(command) {
+                worker
+                    .pending_capture_commands
+                    .fetch_sub(1, Ordering::Relaxed);
+                return Err(format!("capture worker send failed: {error}"));
+            }
+            let pending_capture_queue = worker.pending_capture_commands.load(Ordering::Relaxed);
+            let pending_stage_queue = worker.pending_stage_batches.load(Ordering::Relaxed);
 
             controller.capture_tick_in_flight = true;
             controller.ui_state.upload = StageStatus::Running;
@@ -1302,14 +1371,16 @@ mod win32_ui {
                 "capture",
                 "tick_dispatched",
                 &format!(
-                    "tick_seq={} dispatched_total={} selected_display={}",
+                    "tick_seq={} dispatched_total={} selected_display={} pending_capture_queue={} pending_stage_queue={}",
                     timer_tick_seq,
                     controller.perf_stats.timer_ticks_dispatched,
                     controller
                         .ui_state
                         .selected_display
                         .as_deref()
-                        .unwrap_or("none")
+                        .unwrap_or("none"),
+                    pending_capture_queue,
+                    pending_stage_queue
                 ),
             );
             Ok(())
@@ -1362,6 +1433,11 @@ mod win32_ui {
                         buffered_frames,
                         queue_wait_ms,
                         capture_duration_ms,
+                        capture_lag_ms,
+                        frame_width,
+                        frame_height,
+                        pending_capture_queue,
+                        pending_stage_queue,
                     } => {
                         controller.capture_tick_in_flight = false;
                         controller.perf_stats.worker_events_total =
@@ -1384,10 +1460,27 @@ mod win32_ui {
                             .perf_stats
                             .capture_ms_max
                             .max(capture_duration_ms);
+                        controller.perf_stats.capture_lag_ms_total = controller
+                            .perf_stats
+                            .capture_lag_ms_total
+                            .saturating_add(capture_lag_ms);
+                        controller.perf_stats.capture_lag_ms_max =
+                            controller.perf_stats.capture_lag_ms_max.max(capture_lag_ms);
+                        controller.perf_stats.frame_width_last = frame_width;
+                        controller.perf_stats.frame_height_last = frame_height;
+                        controller.perf_stats.capture_queue_depth_max = controller
+                            .perf_stats
+                            .capture_queue_depth_max
+                            .max(pending_capture_queue);
+                        controller.perf_stats.stage_queue_depth_max = controller
+                            .perf_stats
+                            .stage_queue_depth_max
+                            .max(pending_stage_queue);
                         controller.perf_stats.last_tick_seq = timer_tick_seq;
                         controller.current_frame_number = frame_number;
                         controller.frames_buffered = buffered_frames;
                         controller.current_queue_wait_ms = queue_wait_ms;
+                        controller.current_capture_lag_ms = capture_lag_ms;
                         controller.current_capture_duration_ms = capture_duration_ms;
                         controller.ui_state.analysis_status = format!(
                             "Captured frame {} (batch position {}/9).",
@@ -1399,12 +1492,17 @@ mod win32_ui {
                             "capture",
                             "frame_acquired",
                             &format!(
-                                "tick_seq={} frame={} buffered_frames={} queue_wait_ms={} capture_ms={}",
+                                "tick_seq={} frame={} buffered_frames={} frame_size={}x{} queue_wait_ms={} capture_lag_ms={} capture_ms={} pending_capture_queue={} pending_stage_queue={}",
                                 timer_tick_seq,
                                 frame_number,
                                 buffered_frames,
+                                frame_width,
+                                frame_height,
                                 queue_wait_ms,
-                                capture_duration_ms
+                                capture_lag_ms,
+                                capture_duration_ms,
+                                pending_capture_queue,
+                                pending_stage_queue
                             ),
                         );
                     }
@@ -1414,11 +1512,13 @@ mod win32_ui {
                         prepared_batches,
                         mosaic_width,
                         mosaic_height,
-                        encode_duration_ms,
+                        batch_prepare_ms,
+                        stage_queue_wait_ms,
+                        pending_stage_queue,
                         artifacts,
                     } => {
                         controller.current_frame_number = frame_number;
-                        controller.current_encode_duration_ms = encode_duration_ms;
+                        controller.current_encode_duration_ms = batch_prepare_ms;
                         controller.prepared_batches = prepared_batches;
                         controller.frames_buffered = 0;
                         controller.last_prepared_jpeg = Some(artifacts.jpeg_path.clone());
@@ -1443,11 +1543,23 @@ mod win32_ui {
                         controller.perf_stats.batch_prepare_ms_total = controller
                             .perf_stats
                             .batch_prepare_ms_total
-                            .saturating_add(encode_duration_ms);
+                            .saturating_add(batch_prepare_ms);
                         controller.perf_stats.batch_prepare_ms_max = controller
                             .perf_stats
                             .batch_prepare_ms_max
-                            .max(encode_duration_ms);
+                            .max(batch_prepare_ms);
+                        controller.perf_stats.stage_queue_wait_ms_total = controller
+                            .perf_stats
+                            .stage_queue_wait_ms_total
+                            .saturating_add(stage_queue_wait_ms);
+                        controller.perf_stats.stage_queue_wait_ms_max = controller
+                            .perf_stats
+                            .stage_queue_wait_ms_max
+                            .max(stage_queue_wait_ms);
+                        controller.perf_stats.stage_queue_depth_max = controller
+                            .perf_stats
+                            .stage_queue_depth_max
+                            .max(pending_stage_queue);
                         controller.perf_stats.stage_total_ms_total = controller
                             .perf_stats
                             .stage_total_ms_total
@@ -1477,20 +1589,22 @@ mod win32_ui {
                             "upload_prep",
                             "artifact_ready",
                             &format!(
-                                "tick_seq={} prepared_batches={} jpeg={} json={} raw_rgb_bytes={} base64_chars={} batch_prepare_ms={} stage_total_ms={} rgba_to_rgb_ms={} jpeg_encode_ms={} json_encode_ms={} disk_write_ms={} preview_build_ms={} jpeg_ratio={} base64_ratio={}",
+                                "tick_seq={} prepared_batches={} jpeg={} json={} raw_rgb_bytes={} base64_chars={} batch_prepare_ms={} stage_queue_wait_ms={} stage_total_ms={} rgba_to_rgb_ms={} jpeg_encode_ms={} json_encode_ms={} disk_write_ms={} preview_build_ms={} pending_stage_queue={} jpeg_ratio={} base64_ratio={}",
                                 timer_tick_seq,
                                 prepared_batches,
                                 artifacts.jpeg_path.display(),
                                 artifacts.json_path.display(),
                                 artifacts.raw_rgb_bytes,
                                 artifacts.base64_size_chars,
-                                encode_duration_ms,
+                                batch_prepare_ms,
+                                stage_queue_wait_ms,
                                 artifacts.stage_metrics.stage_total_ms,
                                 artifacts.stage_metrics.rgba_to_rgb_ms,
                                 artifacts.stage_metrics.jpeg_encode_ms,
                                 artifacts.stage_metrics.json_encode_ms,
                                 artifacts.stage_metrics.disk_write_ms,
                                 artifacts.stage_metrics.preview_build_ms,
+                                pending_stage_queue,
                                 compression_ratio(
                                     artifacts.raw_rgb_bytes as u128,
                                     artifacts.jpeg_size_bytes as u128
@@ -1505,7 +1619,7 @@ mod win32_ui {
                             log_info(
                                 "perf",
                                 "periodic_summary",
-                                &controller.perf_stats.summary_line(),
+                                &summary_with_process_snapshot(&controller.perf_stats),
                             );
                         }
                     }
@@ -1530,7 +1644,7 @@ mod win32_ui {
                         log_info(
                             "perf",
                             "capture_profile_summary",
-                            &controller.perf_stats.summary_line(),
+                            &summary_with_process_snapshot(&controller.perf_stats),
                         );
                     }
                 }
@@ -1588,14 +1702,15 @@ mod win32_ui {
             set_control_text(
                 controller.controls.capture_status,
                 &format!(
-                    "Capture: {} | backend={} | running={} | buffered_frames={} | in_flight={} | interval_ms={} | queue_wait_ms={}",
+                    "Capture: {} | backend={} | running={} | buffered_frames={} | in_flight={} | interval_ms={} | queue_wait_ms={} | capture_lag_ms={}",
                     runtime.capture,
                     controller.capture_backend_name,
                     controller.capturing,
                     controller.frames_buffered,
                     controller.capture_tick_in_flight,
                     controller.capture_timer_interval_ms,
-                    controller.current_queue_wait_ms
+                    controller.current_queue_wait_ms,
+                    controller.current_capture_lag_ms
                 ),
             );
             set_control_text(
@@ -1616,10 +1731,11 @@ mod win32_ui {
             set_control_text(
                 controller.controls.frame_status,
                 &format!(
-                    "Frame: total={} | current_batch={}/9 | queue_wait_ms={} | capture_ms={} | batch_prepare_ms={}",
+                    "Frame: total={} | current_batch={}/9 | queue_wait_ms={} | capture_lag_ms={} | capture_ms={} | batch_prepare_ms={}",
                     controller.current_frame_number,
                     controller.frames_buffered,
                     controller.current_queue_wait_ms,
+                    controller.current_capture_lag_ms,
                     controller.current_capture_duration_ms,
                     controller.current_encode_duration_ms
                 ),
@@ -1699,23 +1815,99 @@ mod win32_ui {
     fn shutdown_capture_worker(controller: &mut AppController) {
         if let Some(worker_runtime) = controller.worker_runtime.take() {
             let _ = worker_runtime.command_tx.send(WorkerCommand::Shutdown);
-            let _ = worker_runtime.worker_join.join();
-            log_info("capture_worker", "shutdown", "worker thread joined");
+            let _ = worker_runtime.capture_worker_join.join();
+            let _ = worker_runtime.stage_worker_join.join();
+            log_info(
+                "capture_worker",
+                "shutdown",
+                "capture and stage worker threads joined",
+            );
         }
     }
 
     fn spawn_capture_worker(hwnd: HWND) -> Result<CaptureWorkerRuntime, String> {
         let (command_tx, command_rx) = mpsc::channel::<WorkerCommand>();
         let (event_tx, event_rx) = mpsc::channel::<WorkerEvent>();
+        let (stage_tx, stage_rx) = mpsc::channel::<StageCommand>();
+        let pending_capture_commands = Arc::new(AtomicUsize::new(0));
+        let pending_stage_batches = Arc::new(AtomicUsize::new(0));
         let hwnd_value = hwnd as isize;
+        let stage_event_tx = event_tx.clone();
+        let stage_pending_queue = Arc::clone(&pending_stage_batches);
 
-        let worker_join = std::thread::Builder::new()
+        let stage_worker_join = std::thread::Builder::new()
+            .name("local-guard-stage-worker".to_string())
+            .spawn(move || {
+                let mut prepared_batches: u64 = 0;
+
+                while let Ok(command) = stage_rx.recv() {
+                    match command {
+                        StageCommand::PrepareBatch {
+                            timer_tick_seq,
+                            frame_number,
+                            session_id,
+                            batch,
+                            queued_at,
+                        } => {
+                            stage_pending_queue.fetch_sub(1, Ordering::Relaxed);
+                            let stage_queue_wait_ms = queued_at.elapsed().as_millis();
+                            let prepare_started = Instant::now();
+
+                            let payload = match batch_to_payload(&batch, &session_id) {
+                                Ok(payload) => payload,
+                                Err(error) => {
+                                    let _ = stage_event_tx.send(WorkerEvent::WorkerError(format!(
+                                        "batch-to-payload failed: {error}"
+                                    )));
+                                    notify_capture_worker_event(hwnd_value);
+                                    continue;
+                                }
+                            };
+                            let staged = match stage_payload_for_upload(&payload) {
+                                Ok(staged) => staged,
+                                Err(error) => {
+                                    let _ = stage_event_tx.send(WorkerEvent::WorkerError(format!(
+                                        "artifact staging failed: {error}"
+                                    )));
+                                    notify_capture_worker_event(hwnd_value);
+                                    continue;
+                                }
+                            };
+
+                            prepared_batches = prepared_batches.saturating_add(1);
+                            let _ = stage_event_tx.send(WorkerEvent::BatchPrepared {
+                                timer_tick_seq,
+                                frame_number,
+                                prepared_batches,
+                                mosaic_width: payload.mosaic_width,
+                                mosaic_height: payload.mosaic_height,
+                                batch_prepare_ms: prepare_started.elapsed().as_millis(),
+                                stage_queue_wait_ms,
+                                pending_stage_queue: stage_pending_queue.load(Ordering::Relaxed),
+                                artifacts: staged,
+                            });
+                            notify_capture_worker_event(hwnd_value);
+                        }
+                        StageCommand::ResetBatch => {
+                            prepared_batches = 0;
+                        }
+                        StageCommand::Shutdown => break,
+                    }
+                }
+            })
+            .map_err(|error| format!("failed to spawn stage worker thread: {error}"))?;
+
+        let capture_event_tx = event_tx;
+        let capture_pending_queue = Arc::clone(&pending_capture_commands);
+        let capture_stage_pending_queue = Arc::clone(&pending_stage_batches);
+        let capture_stage_tx = stage_tx;
+        let capture_worker_join = std::thread::Builder::new()
             .name("local-guard-capture-worker".to_string())
             .spawn(move || {
                 let capture_backend = match RealCaptureBackend::discover() {
                     Ok(backend) => backend,
                     Err(error) => {
-                        let _ = event_tx.send(WorkerEvent::WorkerError(format!(
+                        let _ = capture_event_tx.send(WorkerEvent::WorkerError(format!(
                             "capture backend initialization failed: {error}"
                         )));
                         notify_capture_worker_event(hwnd_value);
@@ -1725,7 +1917,7 @@ mod win32_ui {
                 let mut frame_batch = match FrameBatch::new(9) {
                     Ok(batch) => batch,
                     Err(error) => {
-                        let _ = event_tx.send(WorkerEvent::WorkerError(format!(
+                        let _ = capture_event_tx.send(WorkerEvent::WorkerError(format!(
                             "frame batch initialization failed: {error}"
                         )));
                         notify_capture_worker_event(hwnd_value);
@@ -1734,7 +1926,6 @@ mod win32_ui {
                 };
 
                 let mut frame_number: u64 = 0;
-                let mut prepared_batches: u64 = 0;
 
                 while let Ok(command) = command_rx.recv() {
                     match command {
@@ -1745,26 +1936,29 @@ mod win32_ui {
                             captured_at_ms,
                             queued_at,
                         } => {
+                            capture_pending_queue.fetch_sub(1, Ordering::Relaxed);
                             let queue_wait_ms = queued_at.elapsed().as_millis();
                             let capture_started = Instant::now();
                             let frame =
                                 match capture_backend.capture_frame(&display_id, captured_at_ms) {
                                     Ok(frame) => frame,
                                     Err(error) => {
-                                        let _ = event_tx.send(WorkerEvent::WorkerError(format!(
-                                            "frame capture failed: {error}"
-                                        )));
+                                        let _ = capture_event_tx.send(WorkerEvent::WorkerError(
+                                            format!("frame capture failed: {error}"),
+                                        ));
                                         notify_capture_worker_event(hwnd_value);
                                         continue;
                                     }
                                 };
+                            let frame_width = frame.width;
+                            let frame_height = frame.height;
 
                             let maybe_batch = match frame_batch.push_frame(frame) {
                                 Ok(maybe_batch) => maybe_batch,
                                 Err(error) => {
-                                    let _ = event_tx.send(WorkerEvent::WorkerError(format!(
-                                        "frame batch push failed: {error}"
-                                    )));
+                                    let _ = capture_event_tx.send(WorkerEvent::WorkerError(
+                                        format!("frame batch push failed: {error}"),
+                                    ));
                                     notify_capture_worker_event(hwnd_value);
                                     continue;
                                 }
@@ -1772,60 +1966,54 @@ mod win32_ui {
                             frame_number = frame_number.saturating_add(1);
                             let buffered_frames = frame_batch.len();
                             let capture_duration_ms = capture_started.elapsed().as_millis();
+                            let capture_lag_ms =
+                                unix_timestamp_millis().saturating_sub(captured_at_ms as u128);
 
-                            let _ = event_tx.send(WorkerEvent::TickCaptured {
+                            let _ = capture_event_tx.send(WorkerEvent::TickCaptured {
                                 timer_tick_seq,
                                 frame_number,
                                 buffered_frames,
                                 queue_wait_ms,
                                 capture_duration_ms,
+                                capture_lag_ms,
+                                frame_width,
+                                frame_height,
+                                pending_capture_queue: capture_pending_queue
+                                    .load(Ordering::Relaxed),
+                                pending_stage_queue: capture_stage_pending_queue
+                                    .load(Ordering::Relaxed),
                             });
                             notify_capture_worker_event(hwnd_value);
 
                             if let Some(batch) = maybe_batch {
-                                let prepare_started = Instant::now();
-                                let payload = match batch_to_payload(&batch, &session_id) {
-                                    Ok(payload) => payload,
-                                    Err(error) => {
-                                        let _ = event_tx.send(WorkerEvent::WorkerError(format!(
-                                            "batch-to-payload failed: {error}"
-                                        )));
-                                        notify_capture_worker_event(hwnd_value);
-                                        continue;
-                                    }
-                                };
-                                let staged = match stage_payload_for_upload(&payload) {
-                                    Ok(staged) => staged,
-                                    Err(error) => {
-                                        let _ = event_tx.send(WorkerEvent::WorkerError(format!(
-                                            "artifact staging failed: {error}"
-                                        )));
-                                        notify_capture_worker_event(hwnd_value);
-                                        continue;
-                                    }
-                                };
-
-                                prepared_batches = prepared_batches.saturating_add(1);
-                                let _ = event_tx.send(WorkerEvent::BatchPrepared {
+                                capture_stage_pending_queue.fetch_add(1, Ordering::Relaxed);
+                                let stage_command = StageCommand::PrepareBatch {
                                     timer_tick_seq,
                                     frame_number,
-                                    prepared_batches,
-                                    mosaic_width: payload.mosaic_width,
-                                    mosaic_height: payload.mosaic_height,
-                                    encode_duration_ms: prepare_started.elapsed().as_millis(),
-                                    artifacts: staged,
-                                });
-                                notify_capture_worker_event(hwnd_value);
+                                    session_id,
+                                    batch,
+                                    queued_at: Instant::now(),
+                                };
+                                if let Err(error) = capture_stage_tx.send(stage_command) {
+                                    capture_stage_pending_queue.fetch_sub(1, Ordering::Relaxed);
+                                    let _ = capture_event_tx.send(WorkerEvent::WorkerError(
+                                        format!("stage worker send failed: {error}"),
+                                    ));
+                                    notify_capture_worker_event(hwnd_value);
+                                }
                             }
                         }
                         WorkerCommand::ResetBatch => {
                             frame_number = 0;
-                            prepared_batches = 0;
                             if let Ok(new_batch) = FrameBatch::new(9) {
                                 frame_batch = new_batch;
                             }
+                            let _ = capture_stage_tx.send(StageCommand::ResetBatch);
                         }
-                        WorkerCommand::Shutdown => break,
+                        WorkerCommand::Shutdown => {
+                            let _ = capture_stage_tx.send(StageCommand::Shutdown);
+                            break;
+                        }
                     }
                 }
             })
@@ -1834,7 +2022,10 @@ mod win32_ui {
         Ok(CaptureWorkerRuntime {
             command_tx,
             event_rx,
-            worker_join,
+            pending_capture_commands,
+            pending_stage_batches,
+            capture_worker_join,
+            stage_worker_join,
         })
     }
 
@@ -1980,6 +2171,70 @@ mod win32_ui {
         format!("{ratio:.2}x")
     }
 
+    fn summary_with_process_snapshot(perf_stats: &PerfStats) -> String {
+        format!(
+            "{} {}",
+            perf_stats.summary_line(),
+            current_process_snapshot()
+        )
+    }
+
+    fn current_process_snapshot() -> String {
+        let logical_cpus = std::thread::available_parallelism()
+            .map(|count| count.get() as u128)
+            .unwrap_or(1);
+        let elapsed_ms = RUN_LOGGER
+            .get()
+            .map(|logger| logger.started_at.elapsed().as_millis())
+            .unwrap_or(0);
+        let wall_100ns = elapsed_ms.saturating_mul(10_000);
+
+        let mut cpu_total_pct = 0.0_f64;
+        let mut working_set_bytes: usize = 0;
+        let mut peak_working_set_bytes: usize = 0;
+        let mut pagefile_bytes: usize = 0;
+
+        unsafe {
+            // Safety:
+            // - Requests stats for current process only; output buffers are valid.
+            let process = GetCurrentProcess();
+            let mut memory: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+            memory.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+            if GetProcessMemoryInfo(
+                process,
+                &mut memory as *mut PROCESS_MEMORY_COUNTERS,
+                memory.cb,
+            ) != 0
+            {
+                working_set_bytes = memory.WorkingSetSize;
+                peak_working_set_bytes = memory.PeakWorkingSetSize;
+                pagefile_bytes = memory.PagefileUsage;
+            }
+
+            let mut creation: FILETIME = std::mem::zeroed();
+            let mut exit: FILETIME = std::mem::zeroed();
+            let mut kernel: FILETIME = std::mem::zeroed();
+            let mut user: FILETIME = std::mem::zeroed();
+            if GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) != 0
+                && wall_100ns > 0
+                && logical_cpus > 0
+            {
+                let process_100ns = filetime_to_u64(kernel).saturating_add(filetime_to_u64(user));
+                cpu_total_pct =
+                    (process_100ns as f64 * 100.0) / (wall_100ns as f64 * logical_cpus as f64);
+            }
+        }
+
+        format!(
+            "proc_cpu_total_pct={cpu_total_pct:.2} proc_working_set_bytes={} proc_peak_working_set_bytes={} proc_pagefile_bytes={} logical_cpus={}",
+            working_set_bytes, peak_working_set_bytes, pagefile_bytes, logical_cpus
+        )
+    }
+
+    fn filetime_to_u64(value: FILETIME) -> u64 {
+        ((value.dwHighDateTime as u64) << 32) | value.dwLowDateTime as u64
+    }
+
     fn build_preview_bitmap(
         mosaic_rgb: &[u8],
         mosaic_width: u32,
@@ -2004,7 +2259,7 @@ mod win32_ui {
             &source_image,
             target_width,
             target_height,
-            image::imageops::FilterType::Triangle,
+            image::imageops::FilterType::Nearest,
         );
 
         let mut bgr24 = Vec::with_capacity((target_width as usize) * (target_height as usize) * 3);
@@ -2054,8 +2309,8 @@ mod win32_ui {
                     paint_hdc,
                     PREVIEW_DRAW_X,
                     PREVIEW_DRAW_Y,
-                    PREVIEW_DRAW_WIDTH,
-                    PREVIEW_DRAW_HEIGHT,
+                    preview_bitmap.width.min(PREVIEW_DRAW_WIDTH),
+                    preview_bitmap.height.min(PREVIEW_DRAW_HEIGHT),
                     0,
                     0,
                     preview_bitmap.width,
