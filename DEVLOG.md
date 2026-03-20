@@ -933,3 +933,106 @@ Verification:
 
 Next:
 - Re-run the three failing cargo commands in CI or on a local filesystem without the current mount/linking limitation to confirm full gate success.
+
+## 2026-03-20 10:08 UTC | Phase 10 | Provision bubblewrap in the devcontainer image
+Objective:
+- Ensure the development container provides `/usr/bin/bwrap` at startup so Codex does not fall back to the vendored bubblewrap binary.
+
+Actions:
+- Added `.devcontainer/Dockerfile` extending `mcr.microsoft.com/devcontainers/rust:1-bookworm`.
+- Moved OS package installation to image build time and installed `bubblewrap`, `mingw-w64`, `nodejs`, and `npm` with `apt-get`.
+- Updated `.devcontainer/devcontainer.json` to build from the local Dockerfile instead of pulling the base image directly.
+- Simplified `postCreateCommand` so it only performs user-scoped setup (`rustup target add`, Codex CLI install, version check).
+- Updated `README.md` so the development environment documentation matches the new image build flow and package list.
+
+Files changed:
+- `.devcontainer/Dockerfile`
+- `.devcontainer/devcontainer.json`
+- `README.md`
+- `DEVLOG.md`
+
+Commands run:
+- `rg --files -uu | rg '(^|/)(\\.devcontainer/|devcontainer\\.json$|Dockerfile$)'`
+- `sed -n '1,220p' .devcontainer/devcontainer.json`
+- `sed -n '1,220p' README.md`
+- `tail -n 80 DEVLOG.md`
+- `date -u +"%Y-%m-%d %H:%M UTC"`
+
+Verification:
+- Configuration review confirms `bubblewrap` is now installed during image build instead of during `postCreateCommand`, which makes `/usr/bin/bwrap` available as soon as the devcontainer starts.
+
+Next:
+- Run the repository validation gate and inspect the final diff before handoff.
+
+## 2026-03-20 10:10 UTC | Phase 10 | Validate devcontainer bubblewrap provisioning change
+Objective:
+- Execute the mandatory repository validation gate after the devcontainer configuration update and record the result.
+
+Actions:
+- Validated `.devcontainer/devcontainer.json` syntax with `python3 -m json.tool`.
+- Ran the full post-modification validation gate required by `AGENTS.md`.
+- Confirmed the repo still builds successfully for the Windows GNU release target after the container configuration changes.
+
+Files changed:
+- `DEVLOG.md`
+
+Commands run:
+- `python3 -m json.tool .devcontainer/devcontainer.json >/dev/null`
+- `cargo fmt --all`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo test --workspace`
+- `cargo build --release --target x86_64-pc-windows-gnu`
+- `date -u +"%Y-%m-%d %H:%M UTC"`
+
+Verification:
+- `python3 -m json.tool .devcontainer/devcontainer.json` passed.
+- `cargo fmt --all` passed.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` passed.
+- `cargo test --workspace` passed, including doctests.
+- `cargo build --release --target x86_64-pc-windows-gnu` passed.
+
+Next:
+- Rebuild or reopen the devcontainer so the new Dockerfile is used for future sessions.
+
+## 2026-03-20 10:57 UTC | Phase 10 | Upgrade agent workflow to manager / critic / builder / evaluator refinement
+Objective:
+- Refresh the repository's agent-facing guidance to use a more explicit actor-critic / builder-evaluator-manager workflow with multi-cycle iterative refinement and clearer pattern-selection rules.
+
+Actions:
+- Reviewed existing agent-related repository artifacts (`AGENTS.md`, `TODO.md`, `README.md`) and confirmed the current protocol only encoded a `Critic <-> Builder` loop.
+- Consulted current primary sources on evaluator-optimizer, orchestrator-worker, layered evals, debate/jury-style oversight, and actor-critic language-agent methods.
+- Critic `C1`: identified three gaps in the repo guidance:
+  - no explicit `Manager` role for scope, stop conditions, and accepted-risk ownership;
+  - no explicit `Evaluator` role separating deterministic evidence from softer model-based judgment;
+  - no repo-specific rule for when to stay single-agent versus escalating to workflow or multi-agent orchestration.
+- Builder `B1` (`fixed`): updated `AGENTS.md` to define `Manager -> Critic -> Builder/Actor -> Evaluator -> Manager`, added evaluator-layer expectations, and added pattern-selection rules.
+- Builder `B1` (`fixed`): updated `TODO.md` to align the plan-quality gate with the same roles and stop conditions.
+- Builder `B1` (`fixed`): added `docs/AGENT_WORKFLOW.md` as the detailed repo playbook for cycle templates, evidence hierarchy, and pattern selection.
+- Critic `C2`: identified two weaknesses in the first draft:
+  - the repo file-role maps did not yet acknowledge the new workflow document;
+  - one draft actor-critic reference was insufficiently verified.
+- Builder `B2` (`fixed`): added the new workflow document to the repo file-role maps in `AGENTS.md` and `README.md`, linked it from `TODO.md`, replaced the weak citation with verified sources, and added the Anthropic multi-agent research-system reference.
+
+Files changed:
+- `AGENTS.md`
+- `TODO.md`
+- `README.md`
+- `docs/AGENT_WORKFLOW.md`
+- `DEVLOG.md`
+
+Commands run:
+- `rg -n "agent|Critic|Builder|evaluator|manager|refine|refinement|review" AGENTS.md README.md TODO.md DEVLOG.md .github -g '!target'`
+- `sed -n '1,260p' AGENTS.md`
+- `sed -n '1,260p' TODO.md`
+- `sed -n '88,130p' TODO.md`
+- `sed -n '1,220p' docs/AGENT_WORKFLOW.md`
+- `sed -n '1,40p' README.md`
+- `ls -la docs`
+- `rg --files docs`
+- `date -u +"%Y-%m-%d %H:%M UTC"`
+
+Verification:
+- Document review confirms the repo now encodes an explicit manager/critic/builder/evaluator loop, layered evaluation rules, single-agent versus multi-agent pattern selection, and a dedicated detailed workflow artifact instead of scattering the guidance across partial notes.
+
+Next:
+- Run the mandatory repository validation gate and inspect the final diff before handoff.

@@ -18,13 +18,15 @@ Client behavior is capture-and-deliver: no client-side censorship or content mut
 - `TODO.md`: product brief + execution roadmap (single source of execution state).
 - `DEVLOG.md`: chronological implementation log of critical execution steps.
 - `AGENTS.md`: contributor/agent operating protocol.
+- `docs/AGENT_WORKFLOW.md`: detailed actor-critic / builder-evaluator-manager execution model.
 
 ## Development environment
 
 This repo uses a Rust devcontainer and includes Windows GNU cross-compilation support.
 
 - Base image: `mcr.microsoft.com/devcontainers/rust:1-bookworm`
-- Extra packages: `mingw-w64`, `nodejs`, `npm`
+- Image extension: `.devcontainer/Dockerfile`
+- Extra packages: `bubblewrap`, `mingw-w64`, `nodejs`, `npm`
 - Rust target: `x86_64-pc-windows-gnu`
 - Codex CLI: installed globally via `@openai/codex`
 
